@@ -1,0 +1,8 @@
+node_modules/
+dist/
+.env
+coverage/
+storage/
+*.log
+.DS_Store
+src/callradar-data/

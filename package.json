@@ -1,0 +1,63 @@
+{
+  "name": "caresense-server",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Bank customer-support call intelligence API",
+  "type": "module",
+  "scripts": {
+    "dev": "tsx watch src/server.ts",
+    "build": "tsc -p tsconfig.json",
+    "start": "node dist/src/server.js",
+    "start:worker": "node dist/src/workers/index.js",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "migrate": "node --import tsx src/db/migrate.ts",
+    "migrate:prod": "node dist/src/db/migrate.js",
+    "flush:all": "node --import tsx src/cli/flush-all.ts",
+    "flush:queues": "node --import tsx src/cli/flush-queues.ts",
+    "retry:failed-analysis": "node --import tsx src/cli/retry-failed-analysis.ts",
+    "reanalyze:existing": "node --import tsx src/cli/reanalyze-existing.ts",
+    "truncate:data": "node --import tsx src/cli/truncate-data.ts",
+    "upload:batch": "node --import tsx src/cli/upload.ts",
+    "analyze:speaker-ids": "node --import tsx src/cli/analyze-speaker-ids.ts",
+    "worker": "node --import tsx src/workers/index.ts",
+    "dev:worker": "tsx watch src/workers/index.ts"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "@aws-sdk/client-s3": "^3.864.0",
+    "@aws-sdk/lib-storage": "^3.864.0",
+    "ajv": "^8.17.1",
+    "ajv-formats": "^3.0.1",
+    "axios": "^1.19.0",
+    "bullmq": "^6.2.2",
+    "busboy": "^1.6.0",
+    "dotenv": "^17.2.1",
+    "express": "^5.1.0",
+    "form-data": "^4.0.6",
+    "ioredis": "^6.0.0",
+    "openai": "^7.5.0",
+    "pg": "^8.16.3",
+    "pino": "^9.9.0",
+    "pino-http": "^10.5.0",
+    "yauzl": "^3.2.0",
+    "zod": "^4.0.17"
+  },
+  "devDependencies": {
+    "@types/busboy": "^1.5.4",
+    "@types/express": "^5.0.3",
+    "@types/node": "^24.3.0",
+    "@types/pg": "^8.15.5",
+    "@types/supertest": "^6.0.3",
+    "@types/yauzl": "^2.10.3",
+    "@types/yazl": "^3.3.1",
+    "supertest": "^7.1.4",
+    "tsx": "^4.20.5",
+    "typescript": "^5.9.2",
+    "vitest": "^3.2.4",
+    "yazl": "^3.3.1"
+  }
+}

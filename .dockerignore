@@ -1,0 +1,8 @@
+.env
+.git
+dist
+node_modules
+storage
+src/callData
+*.zip
+npm-debug.log*
