@@ -15,7 +15,6 @@ import type { QueueService } from './queues/queue.service.js';
 import { parseByteRange } from './api/range.js';
 import { callStatuses, issueCategories, resolutionStatuses, urgencyLevels } from './services/analysis.js';
 import type { ChatService } from './services/chat.js';
-import type { CoachingInsightService } from './services/coachingInsight.js';
 
 const booleanQuery = z.enum(['true', 'false']).transform((value) => value === 'true');
 const pagination = {
@@ -125,8 +124,7 @@ function teamPeriod(value: { date?: string; date_from?: string; date_to?: string
 
 export function createApp(config: Config, repository: Repository, transcriptionRepository: TranscriptionRepository,
   analysisRepository: AnalysisRepository, callRepository: CallRepository, dashboardRepository: DashboardRepository,
-  settingsRepository: SettingsRepository, storage: ObjectStorage, queues: QueueService, chatService: ChatService,
-  coachingInsightService: CoachingInsightService) {
+  settingsRepository: SettingsRepository, storage: ObjectStorage, queues: QueueService, chatService: ChatService) {
   const app = express();
   app.disable('x-powered-by');
   app.use(pinoHttp({ logger: pino({ level: config.NODE_ENV === 'test' ? 'silent' : 'info' }) }));
@@ -295,9 +293,11 @@ export function createApp(config: Config, repository: Repository, transcriptionR
     else response.json(result);
   });
   app.get('/api/v1/dashboard/coaching-insight', async (_request, response) => {
-    const signals = await dashboardRepository.getTeamCoachingSignals();
-    const insight = await coachingInsightService.generate(signals);
-    response.json({ insight });
+    const cached = await dashboardRepository.getCachedCoachingInsight();
+    response.json({
+      insight: cached?.insight ?? 'Not enough analyzed calls yet to generate a coaching insight.',
+      generated_at: cached?.generated_at ?? null
+    });
   });
   app.get('/api/v1/settings', async (_request, response) => {
     response.json(await settingsRepository.get());

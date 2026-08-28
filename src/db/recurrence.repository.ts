@@ -227,8 +227,15 @@ export class RecurrenceRepository {
     }
   }
 
-  async refreshBatchState(batchId: string): Promise<void> {
-    await this.pool.query(
+  /**
+   * Returns true only the first time this batch's state is computed to be
+   * terminal (COMPLETED/COMPLETED_WITH_FAILURES) — the WHERE guard means the
+   * UPDATE (and RETURNING) is skipped entirely once a batch is already in a
+   * terminal state, so repeat calls from the various pipeline-stage hooks
+   * that call this don't re-report a "just finished" signal every time.
+   */
+  async refreshBatchState(batchId: string): Promise<boolean> {
+    const result = await this.pool.query<{ processing_state: string }>(
       `UPDATE upload_batches b SET processing_state=CASE
          WHEN EXISTS (SELECT 1 FROM call_recordings c WHERE c.batch_id=b.id
            AND c.transcription_status IN ('PENDING','QUEUED','TRANSCRIBING')) THEN 'TRANSCRIBING'
@@ -245,7 +252,11 @@ export class RecurrenceRepository {
           (c.transcription_status='COMPLETED' AND c.analysis_status IN ('PENDING','QUEUED','ANALYZING')) OR
           (c.analysis_status='COMPLETED' AND c.recurrence_status IN ('PENDING','QUEUED','LINKING'))))
          THEN NULL ELSE now() END,updated_at=now()
-       WHERE b.id=$1 AND b.ingestion_state IN ('COMPLETED','PARTIAL')`, [batchId]
+       WHERE b.id=$1 AND b.ingestion_state IN ('COMPLETED','PARTIAL')
+         AND b.processing_state NOT IN ('COMPLETED','COMPLETED_WITH_FAILURES')
+       RETURNING processing_state`, [batchId]
     );
+    const newState = result.rows[0]?.processing_state;
+    return newState === 'COMPLETED' || newState === 'COMPLETED_WITH_FAILURES';
   }
 }

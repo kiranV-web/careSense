@@ -11,7 +11,6 @@ import { ObjectStorage } from './services/storage.js';
 import { createApp } from './app.js';
 import { QueueService } from './queues/queue.service.js';
 import { ChatService } from './services/chat.js';
-import { CoachingInsightService } from './services/coachingInsight.js';
 
 const config = loadConfig();
 const pool = createPool(config);
@@ -23,12 +22,11 @@ const dashboardRepository = new DashboardRepository(pool);
 const settingsRepository = new SettingsRepository(pool);
 const chatRepository = new ChatRepository(pool);
 const chatService = new ChatService(config, chatRepository);
-const coachingInsightService = new CoachingInsightService(config);
 const storage = new ObjectStorage(config);
 const queues = new QueueService(config);
 const app = createApp(
   config, repository, transcriptionRepository, analysisRepository, callRepository, dashboardRepository,
-  settingsRepository, storage, queues, chatService, coachingInsightService
+  settingsRepository, storage, queues, chatService
 );
 
 const server = app.listen(config.PORT, () => console.log(`CareSense listening on http://localhost:${config.PORT}`));

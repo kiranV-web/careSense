@@ -8,6 +8,7 @@ import { TranscriptionRepository } from '../db/transcription.repository.js';
 import { AnalysisRepository } from '../db/analysis.repository.js';
 import { RecurrenceRepository } from '../db/recurrence.repository.js';
 import { SettingsRepository } from '../db/settings.repository.js';
+import { DashboardRepository } from '../db/dashboard.repository.js';
 import { QueueService, type AnalysisJobData, type IngestionJobData, type RecurrenceJobData,
   type TranscriptionJobData } from '../queues/queue.service.js';
 import { ingestArchive } from '../services/ingestion.js';
@@ -15,6 +16,7 @@ import { ObjectStorage } from '../services/storage.js';
 import { TranscriptionContractError, TranscriptionService } from '../services/transcription.js';
 import { AnalysisService } from '../services/analysis.js';
 import { RecurrenceAnalysisService } from '../services/recurrence-analysis.js';
+import { CoachingInsightService } from '../services/coachingInsight.js';
 
 const config = loadConfig();
 const pool = createPool(config);
@@ -23,11 +25,32 @@ const transcriptionRepository = new TranscriptionRepository(pool);
 const analysisRepository = new AnalysisRepository(pool);
 const recurrenceRepository = new RecurrenceRepository(pool);
 const settingsRepository = new SettingsRepository(pool);
+const dashboardRepository = new DashboardRepository(pool);
 const storage = new ObjectStorage(config);
 const transcriptionService = new TranscriptionService(config, storage);
 const analysisService = new AnalysisService(config);
 const recurrenceAnalysisService = new RecurrenceAnalysisService(config);
+const coachingInsightService = new CoachingInsightService(config);
 const queues = new QueueService(config);
+
+/**
+ * Wraps recurrenceRepository.refreshBatchState (called from every pipeline
+ * stage's success/failure hook) so the team coaching insight is regenerated
+ * once a batch genuinely finishes — not on every dashboard page load. Never
+ * throws: a coaching-insight failure shouldn't fail the pipeline job that
+ * triggered it.
+ */
+async function refreshBatchStateAndInsight(batchId: string): Promise<void> {
+  const justCompleted = await recurrenceRepository.refreshBatchState(batchId);
+  if (!justCompleted) return;
+  try {
+    const signals = await dashboardRepository.getTeamCoachingSignals();
+    const insight = await coachingInsightService.generate(signals);
+    await dashboardRepository.saveCoachingInsight(insight);
+  } catch (error) {
+    console.error('Failed to regenerate team coaching insight:', error instanceof Error ? error.message : error);
+  }
+}
 const ingestionConnection = new Redis(config.REDIS_URL, { maxRetriesPerRequest: null });
 const transcriptionConnection = new Redis(config.REDIS_URL, { maxRetriesPerRequest: null });
 const analysisConnection = new Redis(config.REDIS_URL, { maxRetriesPerRequest: null });
@@ -55,7 +78,7 @@ const transcriptionWorker = new Worker<TranscriptionJobData>('transcription', as
     if (error instanceof TranscriptionContractError) {
       await transcriptionRepository.markFailed(recording.id, error.code);
       await recurrenceRepository.prepareBatch(recording.batch_id);
-      await recurrenceRepository.refreshBatchState(recording.batch_id);
+      await refreshBatchStateAndInsight(recording.batch_id);
       throw new UnrecoverableError(error.code);
     }
     throw error;
@@ -75,7 +98,7 @@ const analysisWorker = new Worker<AnalysisJobData>('analysis', async (job: Job<A
     config.ANALYSIS_PROMPT_VERSION, results);
   await Promise.all(batchIds.map(async (batchId) => {
     await recurrenceRepository.prepareBatch(batchId);
-    await recurrenceRepository.refreshBatchState(batchId);
+    await refreshBatchStateAndInsight(batchId);
   }));
 }, { connection: analysisConnection, concurrency: config.ANALYSIS_CONCURRENCY });
 
@@ -88,7 +111,7 @@ const recurrenceWorker = new Worker<RecurrenceJobData>('recurrence', async (job:
   if (await repository.isBatchCancelled(job.data.batchId)) return;
   await recurrenceRepository.saveCustomerReview(job.data, settings.recurring_lookback_days, candidates, groups,
     config.OPENAI_RECURRENCE_MODEL, config.RECURRENCE_PROMPT_VERSION);
-  await recurrenceRepository.refreshBatchState(job.data.batchId);
+  await refreshBatchStateAndInsight(job.data.batchId);
 }, { connection: recurrenceConnection, concurrency: config.RECURRENCE_CONCURRENCY });
 
 transcriptionWorker.on('failed', async (job, error) => {
@@ -101,7 +124,7 @@ transcriptionWorker.on('failed', async (job, error) => {
   const reason = error.message.slice(0, 1_000);
   await transcriptionRepository.markFailed(recording.id, reason);
   await recurrenceRepository.prepareBatch(recording.batch_id);
-  await recurrenceRepository.refreshBatchState(recording.batch_id);
+  await refreshBatchStateAndInsight(recording.batch_id);
 });
 
 analysisWorker.on('failed', async (job, error) => {
@@ -113,7 +136,7 @@ analysisWorker.on('failed', async (job, error) => {
     config.OPENAI_ANALYSIS_MODEL, config.ANALYSIS_PROMPT_VERSION);
   await Promise.all(outcome.batchIds.map(async (batchId) => {
     await recurrenceRepository.prepareBatch(batchId);
-    await recurrenceRepository.refreshBatchState(batchId);
+    await refreshBatchStateAndInsight(batchId);
   }));
 });
 
@@ -123,7 +146,7 @@ recurrenceWorker.on('failed', async (job, error) => {
   if (job.attemptsMade < attempts) return;
   if (await repository.isBatchCancelled(job.data.batchId)) return;
   await recurrenceRepository.markFailed(job.data, error.message.slice(0, 1_000));
-  await recurrenceRepository.refreshBatchState(job.data.batchId);
+  await refreshBatchStateAndInsight(job.data.batchId);
 });
 
 let dispatching = false;
