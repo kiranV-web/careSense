@@ -25,7 +25,7 @@
     "dev:worker": "tsx watch src/workers/index.ts"
   },
   "engines": {
-    "node": ">=20"
+    "node": ">=22"
   },
   "dependencies": {
     "@aws-sdk/client-s3": "^3.864.0",
