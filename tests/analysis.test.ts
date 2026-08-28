@@ -118,20 +118,23 @@ describe('structured transcript analysis validation', () => {
     expect(validateAnalysisResponse(response, inputs)[0]?.call_statuses).not.toContain('RECURRING');
   });
 
-  it('accepts null etiquette for a rude agent call', () => {
+  it('forces empathy to false for a rude agent call while still evaluating the other rules', () => {
     const response = validResponse();
     response.calls[0]!.call_statuses = ['RUDE'];
     response.calls[0]!.needs_manager_attention = true;
-    response.calls[0]!.rules = null as unknown as typeof response.calls[0]['rules'];
-    expect(validateAnalysisResponse(response, inputs)[0]?.rules).toBeNull();
+    response.calls[0]!.rules!.greeted_customer = false;
+    response.calls[0]!.rules!.showed_empathy_applicable = false;
+    response.calls[0]!.rules!.showed_empathy = null;
+    const result = validateAnalysisResponse(response, inputs)[0]!;
+    expect(result.rules?.showed_empathy_applicable).toBe(true);
+    expect(result.rules?.showed_empathy).toBe(false);
+    expect(result.rules?.greeted_customer).toBe(false);
   });
 
-  it('rejects etiquette results for a rude agent call', () => {
+  it('rejects a response missing etiquette rules', () => {
     const response = validResponse();
-    response.calls[0]!.call_statuses = ['RUDE'];
-    expect(() => validateAnalysisResponse(response, inputs)).toThrowError(
-      expect.objectContaining<Partial<AnalysisContractError>>({ code: 'RUDE_CALL_HAS_ETIQUETTE' })
-    );
+    response.calls[0]!.rules = null as unknown as typeof response.calls[0]['rules'];
+    expect(() => validateAnalysisResponse(response, inputs)).toThrowError(AnalysisContractError);
   });
 
   it('normalizes dropped calls to the dropped verdict and summary contract', () => {
