@@ -25,20 +25,87 @@ const processingStateSql = `CASE
   WHEN c.recurrence_status IN ('PENDING','QUEUED','LINKING') THEN 'LINKING_RECURRING_CALLS'
   ELSE 'COMPLETED' END`;
 
+export type GroupedCallStatusFilter = 'resolved' | 'improve_quality' | 'recurring' | 'attention'
+  | 'unresolved' | 'analysis_failed' | 'dropped' | 'rude';
+
+/**
+ * Mirrors the frontend's status-derivation priority chain exactly (see
+ * callStatusFromBackend/statusFromRecurringOutcome in mappers.ts): a failed
+ * analysis always displays as "analysis-failed" regardless of resolution
+ * status, DROPPED beats RECURRING, etc. Calls and recurring groups use
+ * different status columns (call_recordings vs. recurring_call_groups),
+ * so each filter needs a clause for both branches of the calls-grouped
+ * UNION — groups have no needs_manager_attention/analysis_status/rude
+ * concept, so several filters can never match a group, matching today's
+ * client-side behavior exactly.
+ */
+function groupedFilterClauses(filter: GroupedCallStatusFilter | undefined): { callClause: string; groupClause: string } {
+  // Each call clause explicitly excludes every higher-priority category in the
+  // chain (DROPPED > RECURRING > IMPROVE_QUALITY > ATTENTION > RESOLVED >
+  // everything else = UNRESOLVED), not just its own positive condition —
+  // otherwise a call matching two conditions (e.g. RESOLVED_BUT_IMPROVE_QUALITY
+  // *and* needs_manager_attention) would double-count under both filters
+  // instead of the one the frontend's priority chain actually picks.
+  const notFailed = `c.analysis_status<>'FAILED'`;
+  const notDropped = `c.resolution_status<>'DROPPED'`;
+  const notRecurring = `NOT('RECURRING'=ANY(c.call_statuses))`;
+  const notImproveQuality = `c.resolution_status<>'RESOLVED_BUT_IMPROVE_QUALITY'`;
+  const notAttention = `NOT c.needs_manager_attention`;
+  switch (filter) {
+    case 'dropped':
+      return { callClause: `${notFailed} AND c.resolution_status='DROPPED'`, groupClause: `g.outcome_status='DROPPED'` };
+    case 'recurring':
+      return {
+        callClause: `${notFailed} AND ${notDropped} AND 'RECURRING'=ANY(c.call_statuses)`,
+        groupClause: `g.outcome_status NOT IN ('RESOLVED','RESOLVED_BUT_IMPROVE_QUALITY','DROPPED','ESCALATED')`
+      };
+    case 'improve_quality':
+      return {
+        callClause: `${notFailed} AND ${notDropped} AND ${notRecurring} AND c.resolution_status='RESOLVED_BUT_IMPROVE_QUALITY'`,
+        groupClause: `g.outcome_status='RESOLVED_BUT_IMPROVE_QUALITY'`
+      };
+    case 'attention':
+      return {
+        callClause: `${notFailed} AND ${notDropped} AND ${notRecurring} AND ${notImproveQuality} AND c.needs_manager_attention`,
+        groupClause: 'false'
+      };
+    case 'resolved':
+      return {
+        callClause: `${notFailed} AND ${notDropped} AND ${notRecurring} AND ${notImproveQuality} AND ${notAttention} AND c.resolution_status='RESOLVED'`,
+        groupClause: `g.outcome_status='RESOLVED'`
+      };
+    case 'unresolved':
+      return {
+        callClause: `${notFailed} AND ${notDropped} AND ${notRecurring} AND ${notImproveQuality} AND ${notAttention} AND c.resolution_status<>'RESOLVED'`,
+        groupClause: 'false'
+      };
+    case 'analysis_failed':
+      return { callClause: `c.analysis_status='FAILED'`, groupClause: 'false' };
+    case 'rude':
+      return { callClause: `${notFailed} AND 'RUDE'=ANY(c.call_statuses)`, groupClause: 'false' };
+    default:
+      return { callClause: 'true', groupClause: 'true' };
+  }
+}
+
 export class CallRepository {
   constructor(private readonly pool: pg.Pool) {}
 
-  async listGrouped(page: number, pageSize: number, startedFrom?: string, startedTo?: string): Promise<{
+  async listGrouped(page: number, pageSize: number, startedFrom?: string, startedTo?: string,
+    statusFilter?: GroupedCallStatusFilter): Promise<{
     items: Record<string, unknown>[]; pagination: Record<string, number>
   }> {
     const offset = (page - 1) * pageSize;
+    const { callClause, groupClause } = groupedFilterClauses(statusFilter);
     const entries = await this.pool.query<{ item_type: 'CALL' | 'RECURRING_GROUP'; id: string; total_count: number }>(
       `WITH list_entries AS (
          SELECT 'RECURRING_GROUP'::text AS item_type,g.id,g.created_at AS sort_at
          FROM recurring_call_groups g
+         WHERE ${groupClause}
          UNION ALL
          SELECT 'CALL'::text,c.id,c.created_at AS sort_at FROM call_recordings c
          WHERE NOT EXISTS (SELECT 1 FROM recurring_call_members m WHERE m.call_recording_id=c.id)
+           AND (${callClause})
        )
        SELECT item_type,id,count(*) OVER()::integer AS total_count FROM list_entries
        WHERE ($3::timestamptz IS NULL OR sort_at >= $3) AND ($4::timestamptz IS NULL OR sort_at <= $4)

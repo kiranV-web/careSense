@@ -34,8 +34,11 @@ const callListQuery = z.object({
   started_from: z.string().datetime({ offset: true }).optional(), started_to: z.string().datetime({ offset: true }).optional(),
   ...pagination
 }).strict();
+const groupedCallStatusFilters = ['resolved', 'improve_quality', 'recurring', 'attention',
+  'unresolved', 'analysis_failed', 'dropped', 'rude'] as const;
 const groupedCallListQuery = z.object({
   ...pagination,
+  status_filter: z.enum(groupedCallStatusFilters).optional(),
   started_from: z.string().datetime({ offset: true }).optional(),
   started_to: z.string().datetime({ offset: true }).optional()
 }).strict();
@@ -238,7 +241,9 @@ export function createApp(config: Config, repository: Repository, transcriptionR
   });
   app.get('/api/v1/calls-grouped', async (request, response) => {
     const query = groupedCallListQuery.parse(request.query);
-    response.json(await callRepository.listGrouped(query.page, query.page_size, query.started_from, query.started_to));
+    response.json(await callRepository.listGrouped(
+      query.page, query.page_size, query.started_from, query.started_to, query.status_filter
+    ));
   });
   app.get('/api/v1/recurring-groups/:groupId', async (request, response) => {
     const groupId = z.string().uuid().parse(request.params.groupId);
