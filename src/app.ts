@@ -1,4 +1,5 @@
 import express from 'express';
+import path from 'node:path';
 import pino from 'pino';
 import { pinoHttp } from 'pino-http';
 import { z, ZodError } from 'zod';
@@ -142,6 +143,11 @@ export function createApp(config: Config, repository: Repository, transcriptionR
   app.use(express.json({ limit: '32kb' }));
 
   app.get('/health', (_request, response) => response.json({ status: 'ok' }));
+  app.get('/api/v1/assets/coaching-insight-video', (_request, response) => {
+    response.setHeader('Cache-Control', 'public, max-age=86400, immutable');
+    response.type('video/mp4');
+    response.sendFile(path.resolve(process.cwd(), 'src/17556379.mp4'));
+  });
   app.get('/ready', async (_request, response) => {
     try {
       await storage.ready();
