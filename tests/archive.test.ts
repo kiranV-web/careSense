@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { isMacOsMetadataPath, isSafeZipPath } from '../src/services/archive.js';
+import { isEncryptedZipEntry, isMacOsMetadataPath, isSafeZipPath } from '../src/services/archive.js';
 
 describe('ZIP path safety', () => {
   it('recognizes macOS resource-fork entries as ignorable metadata', () => {
@@ -15,4 +15,11 @@ describe('ZIP path safety', () => {
     ('rejects unsafe path %s', (filename) => {
       expect(isSafeZipPath(filename)).toBe(false);
     });
+});
+
+describe('ZIP encryption validation', () => {
+  it('detects the standard password-protection flag', () => {
+    expect(isEncryptedZipEntry({ generalPurposeBitFlag: 0x1 })).toBe(true);
+    expect(isEncryptedZipEntry({ generalPurposeBitFlag: 0x800 })).toBe(false);
+  });
 });

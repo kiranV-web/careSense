@@ -6,7 +6,8 @@ import { validateMetadata } from '../domain/metadata.js';
 
 export type PairingStatus = 'PAIRED' | 'MISSING_AUDIO' | 'MISSING_METADATA' | 'INVALID_METADATA' |
   'DUPLICATE_AUDIO' | 'DUPLICATE_METADATA' | 'DUPLICATE_CALL_ID' | 'DUPLICATE_RECORDING' |
-  'FILE_TOO_LARGE' | 'UNSUPPORTED_FILE' | 'UPLOAD_FAILED';
+  'FILE_TOO_LARGE' | 'UNSUPPORTED_FILE' | 'AUDIO_TOO_SHORT' | 'SILENT_AUDIO' | 'MUSIC_DETECTED' |
+  'INVALID_AUDIO' | 'UPLOAD_FAILED';
 
 export interface StagingItem {
   stem: string;
@@ -31,6 +32,10 @@ export function isSafeZipPath(filename: string): boolean {
 export function isMacOsMetadataPath(filename: string): boolean {
   const parts = filename.split('/');
   return parts.includes('__MACOSX') || parts.some((part) => part.startsWith('._'));
+}
+
+export function isEncryptedZipEntry(entry: Pick<Entry, 'generalPurposeBitFlag'>): boolean {
+  return (entry.generalPurposeBitFlag & 0x1) !== 0;
 }
 
 function openZip(zipPath: string): Promise<ZipFile> {
@@ -97,6 +102,9 @@ export async function inspectArchive(zipPath: string, maxEntries: number, maxFil
     zip.on('error', reject);
     zip.on('end', resolve);
     zip.on('entry', (entry: Entry) => {
+      if (isEncryptedZipEntry(entry)) {
+        return reject(new Error('Password-protected ZIP archives are unsupported'));
+      }
       entryCount += 1;
       extractedBytes += entry.uncompressedSize;
       if (entryCount > maxEntries) return reject(new Error(`Archive exceeds ${maxEntries} entries`));

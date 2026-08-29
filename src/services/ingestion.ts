@@ -1,11 +1,38 @@
 import path from 'node:path';
+import { createWriteStream } from 'node:fs';
+import { mkdir, mkdtemp, rm } from 'node:fs/promises';
+import { pipeline } from 'node:stream/promises';
 import type { Config } from '../config.js';
 import type { Repository } from '../db/repository.js';
 import { fingerprintZipEntry, inspectArchive, withZipEntry, type StagingItem } from './archive.js';
+import { validateAudioFile, type AudioValidationResult } from './audio-validation.js';
 import type { ObjectStorage } from './storage.js';
 
 function databaseErrorCode(error: unknown): string | undefined {
   return typeof error === 'object' && error !== null && 'code' in error ? String(error.code) : undefined;
+}
+
+async function preflightArchiveAudio(archivePath: string, item: StagingItem, config: Config): Promise<AudioValidationResult> {
+  if (!item.audio || !item.parsedMetadata) throw new Error('Audio preflight requires a paired call');
+  await mkdir(config.TRANSCRIPTION_TMP_DIR, { recursive: true });
+  const temporaryDirectory = await mkdtemp(path.join(config.TRANSCRIPTION_TMP_DIR, 'preflight-'));
+  const extension = path.posix.extname(item.audio.fileName).toLowerCase();
+  const temporaryAudio = path.join(temporaryDirectory, `recording${extension}`);
+  try {
+    await withZipEntry(archivePath, item.audio.fileName, (stream) => pipeline(stream, createWriteStream(temporaryAudio)));
+    return await validateAudioFile(temporaryAudio, {
+      ffmpegPath: config.FFMPEG_PATH,
+      ffprobePath: config.FFPROBE_PATH,
+      minDurationSeconds: config.AUDIO_MIN_DURATION_SECONDS,
+      silenceThresholdDb: config.AUDIO_SILENCE_THRESHOLD_DB,
+      musicDetectionEnabled: config.AUDIO_MUSIC_DETECTION_ENABLED,
+      musicOverlapThreshold: config.AUDIO_MUSIC_OVERLAP_THRESHOLD,
+      timeoutMs: config.AUDIO_PREFLIGHT_TIMEOUT_MS,
+      expectedChannelLayout: item.parsedMetadata.channel_layout
+    });
+  } finally {
+    await rm(temporaryDirectory, { recursive: true, force: true });
+  }
 }
 
 export async function ingestArchive(batchId: string, archivePath: string, config: Config,
@@ -45,6 +72,24 @@ export async function ingestArchive(batchId: string, archivePath: string, config
       let objectKey: string | undefined;
       let fingerprint: { checksum: string; bytes: number } | undefined;
       try {
+        if (config.AUDIO_PREFLIGHT_ENABLED) {
+          const validation = await preflightArchiveAudio(archivePath, item, config);
+          if (!validation.accepted) {
+            invalid += 1;
+            const failed: StagingItem = {
+              ...item,
+              status: validation.reason,
+              errors: [validation.message, validation.details]
+            };
+            await repository.recordStaging(batchId, failed);
+            await repository.recordAudioValidationFailure(batchId, failed, validation.reason, {
+              message: validation.message,
+              ...validation.details
+            });
+            await repository.updateIngestionCounts(batchId, uploaded, invalid);
+            continue;
+          }
+        }
         fingerprint = await fingerprintZipEntry(archivePath, item.audio.fileName);
         const existing = await repository.findRecordingByChecksum(fingerprint.checksum);
         if (existing) {

@@ -2,6 +2,7 @@ import type pg from 'pg';
 import type { CallMetadata } from '../domain/metadata.js';
 import type { StagingItem } from '../services/archive.js';
 import type { StoredObject } from '../services/storage.js';
+import type { AudioRejectionReason } from '../services/audio-validation.js';
 
 export class Repository {
   constructor(private readonly pool: pg.Pool, private readonly retentionDays: number) {}
@@ -168,6 +169,18 @@ export class Repository {
       [batchId, item.parsedMetadata?.call_id ?? null, item.audio ? 'AUDIO' : 'METADATA',
         entry.fileName, item.status, entry.uncompressedSize,
         JSON.stringify({ validation_errors: item.errors })]
+    );
+  }
+
+  async recordAudioValidationFailure(batchId: string, item: StagingItem, reason: AudioRejectionReason,
+    details: Record<string, unknown>): Promise<void> {
+    if (!item.audio || !item.parsedMetadata) throw new Error('Audio validation failure requires a paired call');
+    await this.pool.query(
+      `INSERT INTO failed_calls
+       (batch_id,external_call_id,file_type,filename,failure_reason,file_size_bytes,max_size_bytes,details)
+       VALUES ($1,$2,'AUDIO',$3,$4,$5,NULL,$6::jsonb)`,
+      [batchId, item.parsedMetadata.call_id, item.audio.fileName, reason, item.audio.uncompressedSize,
+        JSON.stringify(details)]
     );
   }
 
