@@ -34,4 +34,9 @@ describe('diarized transcript normalization', () => {
       { speaker: 'C', start: 2, end: 3, text: 'Three' }
     ] })).toThrowError(expect.objectContaining<Partial<TranscriptionContractError>>({ code: 'DIARIZATION_INCONSISTENT' }));
   });
+
+  it('classifies a genuinely silent/no-speech recording as EMPTY_TRANSCRIPT, not a schema violation', () => {
+    expect(() => normalizeDiarizedTranscript({ duration: 10, segments: [] }))
+      .toThrowError(expect.objectContaining<Partial<TranscriptionContractError>>({ code: 'EMPTY_TRANSCRIPT' }));
+  });
 });

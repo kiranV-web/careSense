@@ -76,10 +76,11 @@ const transcriptionWorker = new Worker<TranscriptionJobData>('transcription', as
     result = await transcriptionService.transcribe(recording);
   } catch (error) {
     if (error instanceof TranscriptionContractError) {
-      await transcriptionRepository.markFailed(recording.id, error.code);
+      const reason = `${error.code}: ${error.message}`.slice(0, 1_000);
+      await transcriptionRepository.markFailed(recording.id, reason);
       await recurrenceRepository.prepareBatch(recording.batch_id);
       await refreshBatchStateAndInsight(recording.batch_id);
-      throw new UnrecoverableError(error.code);
+      throw new UnrecoverableError(reason);
     }
     throw error;
   }

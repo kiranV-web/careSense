@@ -13,12 +13,16 @@ const diarizedResponseSchema = z.object({
   text: z.string().optional(),
   language: z.string().optional(),
   duration: z.number().nonnegative().optional(),
+  // No minimum length here — a genuinely silent/no-speech recording legitimately
+  // returns an empty segments array, which normalizeDiarizedTranscript/
+  // normalizeSingleChannel already classify as the more specific EMPTY_TRANSCRIPT
+  // rather than a generic schema-contract violation.
   segments: z.array(z.object({
     speaker: z.union([z.string(), z.number()]).transform(String),
     text: z.string(),
     start: z.number().nonnegative(),
     end: z.number().nonnegative()
-  })).min(1)
+  }))
 });
 
 export interface NormalizedTranscript {
