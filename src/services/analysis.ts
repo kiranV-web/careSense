@@ -10,7 +10,8 @@ export const issueCategories = [
   'CHEQUEBOOK_REQUEST', 'CHEQUEBOOK_CHANGE', 'MONEY_TRANSFER', 'TRANSFER_FAILED', 'CARD_PAYMENT',
   'CASH_WITHDRAWAL', 'ACCOUNT_BALANCE', 'ACCOUNT_STATEMENT', 'BENEFICIARY_MANAGEMENT', 'UPI_PAYMENT',
   'ONLINE_BANKING', 'ACCOUNT_DETAILS_CHANGE', 'LOAN_ENQUIRY', 'INTEREST_AND_CHARGES', 'FRAUD_OR_SCAM',
-  'CARD_LOST_OR_STOLEN', 'CARD_ACTIVATION', 'CARD_DECLINED', 'REFUND_PENDING', 'OTHER'
+  'CARD_LOST_OR_STOLEN', 'CARD_ACTIVATION', 'CARD_DECLINED', 'REFUND_PENDING',
+  'BRANCH_HOURS_OR_LOCATION', 'APPOINTMENT_SCHEDULING', 'CREDIT_REPORT_REQUEST', 'CARD_REPLACEMENT_STATUS'
 ] as const;
 export const issueCauses = [
   'CUSTOMER_REQUEST', 'INCORRECT_DETAILS', 'INSUFFICIENT_FUNDS', 'TRANSFER_LIMIT', 'BENEFICIARY_NOT_ACTIVE',
@@ -224,9 +225,16 @@ const instructions = `You analyze retail-bank customer-support transcripts. Retu
 The speaker roles are already determined from the recording channels: left is AGENT and right is CUSTOMER.
 Infer textual_tone only from explicit words and conversational context, never from pitch or acoustic qualities. Neutral wording is NEUTRAL.
 Do not infer feelings from the existence of a problem; use only a value from the supplied tone enum.
-Use UNKNOWN where evidence is insufficient. Do not invent issue categories or causes outside the supplied enums.
-Classify cheque-book requests or changes, money transfers, failed transactions, account servicing, card enquiries,
-digital banking, fees, loans, refunds, and fraud using the closest supplied banking category. Never reproduce or infer
+Use UNKNOWN where evidence is insufficient. Do not invent issue categories or causes outside the supplied enums, and
+never leave a call uncategorized — always pick the single closest supplied category, since there is no catch-all
+"other" option. Classify cheque-book requests or changes, money transfers, failed transactions, account servicing,
+card enquiries, digital banking, fees, loans, refunds, and fraud using the closest supplied banking category. Use
+BRANCH_HOURS_OR_LOCATION for branch hours, location, or directions questions; APPOINTMENT_SCHEDULING for booking,
+confirming, or rescheduling a branch appointment; CREDIT_REPORT_REQUEST for requests for a credit score or credit
+report; and CARD_REPLACEMENT_STATUS for questions about the delivery or status of an already-requested replacement
+card (use CARD_LOST_OR_STOLEN instead when the call is about reporting a card lost or stolen). If a call was dropped
+before any topic was raised, still classify it by whatever partial request is evident from the transcript so far.
+Never reproduce or infer
 full card numbers, CVV/CVC values, PINs, passwords, OTPs, or other authentication secrets in generated fields.
 Never return RECURRING in call_statuses; the application calculates recurring calls after analysis.
 Classify a call as DROPPED when the transcript ends abruptly while the conversation is still active, such as an
