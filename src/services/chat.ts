@@ -12,19 +12,38 @@ export class ChatContractError extends Error {
   }
 }
 
-const finalAnswerSchema = z.object({
+const chatTableSchema = z.object({
+  title: z.string().min(1),
+  columns: z.array(z.string()).min(1),
+  rows: z.array(z.array(z.string()))
+}).strict();
+
+export const finalAnswerSchema = z.object({
   answer: z.string().min(1),
-  cited_external_call_ids: z.array(z.string())
+  cited_external_call_ids: z.array(z.string()),
+  table: chatTableSchema.nullable()
 }).strict();
 export type ChatAnswer = z.infer<typeof finalAnswerSchema>;
 
 const finalAnswerJsonSchema = {
-  type: 'object', additionalProperties: false, required: ['answer', 'cited_external_call_ids'],
+  type: 'object', additionalProperties: false, required: ['answer', 'cited_external_call_ids', 'table'],
   properties: {
     answer: { type: 'string', description: 'A natural-language answer to the user, grounded only in tool results.' },
     cited_external_call_ids: {
       type: 'array', items: { type: 'string' },
       description: 'external_call_id values from get_call_evidence results that support this answer. Empty array if none were used.'
+    },
+    table: {
+      type: ['object', 'null'], additionalProperties: false, required: ['title', 'columns', 'rows'],
+      description: 'A structured table view of the same data backing the answer, for questions that are naturally a ranking/breakdown/comparison/list (2+ comparable rows). Every value must come from your tool results — never invent a row. Null for a single-fact or narrative-only answer.',
+      properties: {
+        title: { type: 'string', description: 'Short table caption, e.g. "Agents ranked by quality score".' },
+        columns: { type: 'array', items: { type: 'string' }, description: 'Column headers, e.g. ["Agent", "Quality score", "Calls"].' },
+        rows: {
+          type: 'array', items: { type: 'array', items: { type: 'string' } },
+          description: 'One array per row, same length and order as columns. Format numbers as you would in prose (e.g. "87%", "42 calls").'
+        }
+      }
     }
   }
 };
@@ -39,21 +58,34 @@ Choosing a function:
 - run_readonly_query is a last resort for the remaining ~20% of questions that genuinely don't fit any named
   function (an unusual cross-cut of the data, a one-off aggregation). Only reach for it after checking no
   named function applies, and always pass a short "reason" explaining why.
+- get_open_manager_alerts lists actual actionable alerts; get_manager_alert_status only gives counts — prefer
+  the former for "what should I look at" questions, the latter for "how many are open" questions.
+- get_call_evidence also works as a lookup by customer name or a specific call ID, not just as a filter.
+- get_data_overview answers meta questions about the dataset itself (how much data, is it up to date) — it's
+  not a substitute for the analytics functions above.
+
+Dates:
+- There is no date-range concept anywhere else in this product — every function defaults to full history when
+  date_from/date_to are omitted (pass null for both). Do this for any general or unqualified question.
+- Only pass explicit dates when the user names a specific period themselves (e.g. "in June", "last 7 days").
+  Never guess or narrow a range on your own.
 
 Rules:
 - Answer ONLY using data returned by your function calls. Never invent numbers, names, dates, or call IDs.
-- If a date range isn't specified by the user, ask yourself what's reasonable, but prefer the widest sensible
-  range (e.g. all available data) over guessing a narrow one.
 - Before naming or quoting a specific call, agent-name spelling, or verdict, confirm it via a function result.
 - If you don't know an agent's exact name, call list_agents or rank_agents_by_quality first to find it rather
   than guessing a spelling.
-- Only include a value in cited_external_call_ids if it was returned by get_call_evidence in this conversation.
+- Only include a value in cited_external_call_ids if it was returned by get_call_evidence or
+  get_open_manager_alerts in this conversation.
 - If no available function or reasonable read-only query can answer the question (e.g. it's unrelated to
   calls/agents/customers), say so plainly and briefly describe what you can help with instead — do not guess.
 - Be a little explanatory, not just a bare number: briefly say what the figure means in context (e.g. compared
   to the total, or what counts as a "failure") so the answer stands on its own. Stay concise — a couple of
   sentences, not a report. When asked for a suggestion or what to improve, base it on the actual failure/rate
-  data you fetched, not generic advice.`;
+  data you fetched, not generic advice.
+- Populate the table field whenever the answer is naturally a ranking, breakdown, comparison, or list of 2+
+  comparable rows — copy the exact values from your tool results into columns/rows, never invented or rounded
+  differently than the source. Leave table null for a single-fact or purely narrative answer.`;
 
 export class ChatService {
   private readonly openai: OpenAI;

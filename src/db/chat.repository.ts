@@ -36,6 +36,10 @@ function assertSafeReadonlySql(sql: string): void {
   }
 }
 
+/** Null-safe date-range predicate: omitted bounds mean "no filter" (full history), matching the
+ *  no-date-range-concept default used throughout the rest of the app. Same two params either way. */
+const DATE_RANGE_SQL = '($1::timestamptz IS NULL OR c.started_at >= $1) AND ($2::timestamptz IS NULL OR c.started_at <= $2)';
+
 function agentQualitySelect(extraWhere?: string): string {
   return `
     SELECT a.id, a.name, a.external_id, count(c.id)::int AS call_count,
@@ -47,7 +51,7 @@ function agentQualitySelect(extraWhere?: string): string {
       round((count(c.id) FILTER (WHERE c.resolution_status IN ('RESOLVED','RESOLVED_BUT_IMPROVE_QUALITY'))::numeric
         / NULLIF(count(c.id), 0)) * 100) AS resolution_rate_percent
     FROM agents a
-    JOIN call_recordings c ON c.agent_id = a.id AND c.started_at BETWEEN $1 AND $2
+    JOIN call_recordings c ON c.agent_id = a.id AND ${DATE_RANGE_SQL}
     LEFT JOIN call_evaluations e ON e.call_recording_id = c.id
     ${extraWhere ?? ''}`;
 }
@@ -64,19 +68,20 @@ function mapAgentQualityRow(row: Record<string, unknown>) {
 export class ChatRepository {
   constructor(private readonly pool: pg.Pool) {}
 
-  async getCallVolume(dateFrom: string, dateTo: string, groupBy: 'day' | 'week' | 'month'): Promise<
+  async getCallVolume(dateFrom: string | null, dateTo: string | null, groupBy: 'day' | 'week' | 'month'): Promise<
     Array<{ bucket: string; call_count: number }>
   > {
     const result = await this.pool.query(
       `SELECT date_trunc($3, started_at)::date AS bucket, count(*)::int AS call_count
-       FROM call_recordings WHERE started_at BETWEEN $1 AND $2
+       FROM call_recordings
+       WHERE ($1::timestamptz IS NULL OR started_at >= $1) AND ($2::timestamptz IS NULL OR started_at <= $2)
        GROUP BY 1 ORDER BY 1`,
       [dateFrom, dateTo, groupBy]
     );
     return result.rows.map((row) => ({ bucket: String(row.bucket), call_count: number(row.call_count) }));
   }
 
-  async rankAgentsByQuality(dateFrom: string, dateTo: string, order: 'best' | 'worst',
+  async rankAgentsByQuality(dateFrom: string | null, dateTo: string | null, order: 'best' | 'worst',
     minCallCount: number, limit: number): Promise<ReturnType<typeof mapAgentQualityRow>[]> {
     const direction = order === 'best' ? 'DESC' : 'ASC';
     const result = await this.pool.query(
@@ -90,7 +95,7 @@ export class ChatRepository {
     return result.rows.map(mapAgentQualityRow);
   }
 
-  async compareAgents(agentNames: string[], dateFrom: string, dateTo: string): Promise<ReturnType<typeof mapAgentQualityRow>[]> {
+  async compareAgents(agentNames: string[], dateFrom: string | null, dateTo: string | null): Promise<ReturnType<typeof mapAgentQualityRow>[]> {
     const result = await this.pool.query(
       `${agentQualitySelect('WHERE a.name = ANY($3::text[]) OR a.external_id = ANY($3::text[])')}
        GROUP BY a.id, a.name, a.external_id`,
@@ -111,7 +116,7 @@ export class ChatRepository {
     }));
   }
 
-  async getAgentEtiquetteBreakdown(agentName: string, dateFrom: string, dateTo: string): Promise<
+  async getAgentEtiquetteBreakdown(agentName: string, dateFrom: string | null, dateTo: string | null): Promise<
     Array<{ rule: EtiquetteRule; fail_count: number; total: number; fail_rate_percent: number }>
   > {
     const result = await this.pool.query(
@@ -125,7 +130,8 @@ export class ChatRepository {
          ('provided_clear_guidance', e.provided_clear_guidance), ('thanked_customer', e.thanked_customer),
          ('wished_customer_good_day', e.wished_customer_good_day)
        ) AS r(rule, passed)
-       WHERE c.started_at BETWEEN $2 AND $3 AND (a.name ILIKE '%'||$1||'%' OR a.external_id = $1)
+       WHERE ($2::timestamptz IS NULL OR c.started_at >= $2) AND ($3::timestamptz IS NULL OR c.started_at <= $3)
+         AND (a.name ILIKE '%'||$1||'%' OR a.external_id = $1)
          AND r.passed IS NOT NULL
        GROUP BY r.rule ORDER BY fail_count DESC`,
       [agentName, dateFrom, dateTo]
@@ -138,7 +144,7 @@ export class ChatRepository {
     });
   }
 
-  async getTeamEtiquetteFailureRates(dateFrom: string, dateTo: string): Promise<
+  async getTeamEtiquetteFailureRates(dateFrom: string | null, dateTo: string | null): Promise<
     Array<{ rule: EtiquetteRule; fail_count: number; total: number; fail_rate_percent: number }>
   > {
     const result = await this.pool.query(
@@ -151,7 +157,8 @@ export class ChatRepository {
          ('provided_clear_guidance', e.provided_clear_guidance), ('thanked_customer', e.thanked_customer),
          ('wished_customer_good_day', e.wished_customer_good_day)
        ) AS r(rule, passed)
-       WHERE c.started_at BETWEEN $1 AND $2 AND r.passed IS NOT NULL
+       WHERE ($1::timestamptz IS NULL OR c.started_at >= $1) AND ($2::timestamptz IS NULL OR c.started_at <= $2)
+         AND r.passed IS NOT NULL
        GROUP BY r.rule ORDER BY fail_count DESC`,
       [dateFrom, dateTo]
     );
@@ -165,25 +172,28 @@ export class ChatRepository {
     });
   }
 
-  async getIssueCategoryBreakdown(dateFrom: string, dateTo: string, limit: number): Promise<
+  async getIssueCategoryBreakdown(dateFrom: string | null, dateTo: string | null, limit: number): Promise<
     Array<{ issue_category: string; call_count: number }>
   > {
     const result = await this.pool.query(
       `SELECT issue_category, count(*)::int AS call_count
-       FROM call_recordings WHERE started_at BETWEEN $1 AND $2 AND issue_category IS NOT NULL
+       FROM call_recordings
+       WHERE ($1::timestamptz IS NULL OR started_at >= $1) AND ($2::timestamptz IS NULL OR started_at <= $2)
+         AND issue_category IS NOT NULL
        GROUP BY 1 ORDER BY 2 DESC LIMIT $3`,
       [dateFrom, dateTo, limit]
     );
     return result.rows.map((row) => ({ issue_category: String(row.issue_category), call_count: number(row.call_count) }));
   }
 
-  async getResolutionBreakdown(dateFrom: string, dateTo: string): Promise<
+  async getResolutionBreakdown(dateFrom: string | null, dateTo: string | null): Promise<
     Array<{ resolution_status: string; call_count: number; percent: number }>
   > {
     const result = await this.pool.query(
       `SELECT resolution_status, count(*)::int AS call_count,
          round(count(*)::numeric / NULLIF(sum(count(*)) OVER (), 0) * 100) AS percent
-       FROM call_recordings WHERE started_at BETWEEN $1 AND $2
+       FROM call_recordings
+       WHERE ($1::timestamptz IS NULL OR started_at >= $1) AND ($2::timestamptz IS NULL OR started_at <= $2)
        GROUP BY resolution_status ORDER BY call_count DESC`,
       [dateFrom, dateTo]
     );
@@ -193,19 +203,33 @@ export class ChatRepository {
     }));
   }
 
-  async getBankingProductBreakdown(dateFrom: string, dateTo: string, limit: number): Promise<
+  async getBankingProductBreakdown(dateFrom: string | null, dateTo: string | null, limit: number): Promise<
     Array<{ banking_product: string; call_count: number }>
   > {
     const result = await this.pool.query(
       `SELECT coalesce(nullif(btrim(banking_product), ''), 'GENERAL_BANKING') AS banking_product, count(*)::int AS call_count
-       FROM call_recordings WHERE started_at BETWEEN $1 AND $2
+       FROM call_recordings
+       WHERE ($1::timestamptz IS NULL OR started_at >= $1) AND ($2::timestamptz IS NULL OR started_at <= $2)
        GROUP BY 1 ORDER BY 2 DESC LIMIT $3`,
       [dateFrom, dateTo, limit]
     );
     return result.rows.map((row) => ({ banking_product: String(row.banking_product), call_count: number(row.call_count) }));
   }
 
-  async getCallDurationStats(dateFrom: string, dateTo: string, agentName: string | undefined): Promise<{
+  async getDeviceModelBreakdown(dateFrom: string | null, dateTo: string | null, limit: number): Promise<
+    Array<{ device_model: string; call_count: number }>
+  > {
+    const result = await this.pool.query(
+      `SELECT coalesce(nullif(btrim(device_model), ''), 'GENERAL') AS device_model, count(*)::int AS call_count
+       FROM call_recordings
+       WHERE ($1::timestamptz IS NULL OR started_at >= $1) AND ($2::timestamptz IS NULL OR started_at <= $2)
+       GROUP BY 1 ORDER BY 2 DESC LIMIT $3`,
+      [dateFrom, dateTo, limit]
+    );
+    return result.rows.map((row) => ({ device_model: String(row.device_model), call_count: number(row.call_count) }));
+  }
+
+  async getCallDurationStats(dateFrom: string | null, dateTo: string | null, agentName: string | undefined): Promise<{
     call_count: number; avg_seconds: number | null; min_seconds: number | null; max_seconds: number | null;
     median_seconds: number | null;
   }> {
@@ -217,7 +241,8 @@ export class ChatRepository {
        FROM call_recordings c
        JOIN agents a ON a.id = c.agent_id
        LEFT JOIN transcripts t ON t.call_recording_id = c.id
-       WHERE c.started_at BETWEEN $1 AND $2 AND ($3::text IS NULL OR a.name ILIKE '%'||$3||'%' OR a.external_id = $3)`,
+       WHERE ($1::timestamptz IS NULL OR c.started_at >= $1) AND ($2::timestamptz IS NULL OR c.started_at <= $2)
+         AND ($3::text IS NULL OR a.name ILIKE '%'||$3||'%' OR a.external_id = $3)`,
       [dateFrom, dateTo, agentName ?? null]
     );
     const row = result.rows[0] as Record<string, unknown>;
@@ -228,7 +253,7 @@ export class ChatRepository {
     };
   }
 
-  async getFlaggedCallCounts(dateFrom: string, dateTo: string): Promise<{
+  async getFlaggedCallCounts(dateFrom: string | null, dateTo: string | null): Promise<{
     total: number; rude: number; escalated: number; recurring: number; dropped: number;
     urgency: Array<{ urgency_level: string; call_count: number }>;
   }> {
@@ -239,12 +264,14 @@ export class ChatRepository {
            count(*) FILTER (WHERE 'ESCALATED' = ANY(call_statuses))::int AS escalated,
            count(*) FILTER (WHERE 'RECURRING' = ANY(call_statuses))::int AS recurring,
            count(*) FILTER (WHERE resolution_status = 'DROPPED')::int AS dropped
-         FROM call_recordings WHERE started_at BETWEEN $1 AND $2`,
+         FROM call_recordings
+         WHERE ($1::timestamptz IS NULL OR started_at >= $1) AND ($2::timestamptz IS NULL OR started_at <= $2)`,
         [dateFrom, dateTo]
       ),
       this.pool.query(
         `SELECT urgency_level, count(*)::int AS call_count FROM call_recordings
-         WHERE started_at BETWEEN $1 AND $2 AND urgency_level IS NOT NULL
+         WHERE ($1::timestamptz IS NULL OR started_at >= $1) AND ($2::timestamptz IS NULL OR started_at <= $2)
+           AND urgency_level IS NOT NULL
          GROUP BY urgency_level ORDER BY call_count DESC`,
         [dateFrom, dateTo]
       )
@@ -257,14 +284,15 @@ export class ChatRepository {
     };
   }
 
-  async getCustomerSentimentBreakdown(dateFrom: string, dateTo: string, speakerRole: 'AGENT' | 'CUSTOMER'): Promise<
+  async getCustomerSentimentBreakdown(dateFrom: string | null, dateTo: string | null, speakerRole: 'AGENT' | 'CUSTOMER'): Promise<
     Array<{ textual_tone: string; segment_count: number; percent: number }>
   > {
     const result = await this.pool.query(
       `SELECT s.textual_tone, count(*)::int AS segment_count,
          round(count(*)::numeric / NULLIF(sum(count(*)) OVER (), 0) * 100) AS percent
        FROM transcript_segments s JOIN call_recordings c ON c.id = s.call_recording_id
-       WHERE c.started_at BETWEEN $1 AND $2 AND s.speaker_role = $3 AND s.textual_tone IS NOT NULL
+       WHERE ($1::timestamptz IS NULL OR c.started_at >= $1) AND ($2::timestamptz IS NULL OR c.started_at <= $2)
+         AND s.speaker_role = $3 AND s.textual_tone IS NOT NULL
        GROUP BY s.textual_tone ORDER BY segment_count DESC`,
       [dateFrom, dateTo, speakerRole]
     );
@@ -273,13 +301,13 @@ export class ChatRepository {
     }));
   }
 
-  async getRepeatCustomers(dateFrom: string, dateTo: string, minCalls: number, limit: number): Promise<
+  async getRepeatCustomers(dateFrom: string | null, dateTo: string | null, minCalls: number, limit: number): Promise<
     Array<{ customer_name: string; call_count: number }>
   > {
     const result = await this.pool.query(
       `SELECT coalesce(cu.name, cu.external_id) AS customer_name, count(c.id)::int AS call_count
        FROM customers cu JOIN call_recordings c ON c.customer_id = cu.id
-       WHERE c.started_at BETWEEN $1 AND $2
+       WHERE ($1::timestamptz IS NULL OR c.started_at >= $1) AND ($2::timestamptz IS NULL OR c.started_at <= $2)
        GROUP BY cu.id, cu.name, cu.external_id HAVING count(c.id) >= $3
        ORDER BY call_count DESC LIMIT $4`,
       [dateFrom, dateTo, minCalls, limit]
@@ -287,13 +315,13 @@ export class ChatRepository {
     return result.rows.map((row) => ({ customer_name: String(row.customer_name), call_count: number(row.call_count) }));
   }
 
-  async getManagerAlertStatus(dateFrom: string, dateTo: string): Promise<
+  async getManagerAlertStatus(dateFrom: string | null, dateTo: string | null): Promise<
     Array<{ status: string; urgency_level: string; alert_count: number }>
   > {
     const result = await this.pool.query(
       `SELECT ma.status, ma.urgency_level, count(*)::int AS alert_count
        FROM manager_alerts ma JOIN call_recordings c ON c.id = ma.call_recording_id
-       WHERE c.started_at BETWEEN $1 AND $2
+       WHERE ($1::timestamptz IS NULL OR c.started_at >= $1) AND ($2::timestamptz IS NULL OR c.started_at <= $2)
        GROUP BY ma.status, ma.urgency_level ORDER BY alert_count DESC`,
       [dateFrom, dateTo]
     );
@@ -302,18 +330,82 @@ export class ChatRepository {
     }));
   }
 
+  /** Actual actionable alerts (not just counts) — ordered so the most urgent, longest-open items surface first. */
+  async getOpenManagerAlerts(status: string | null, urgencyLevel: string | null, limit: number): Promise<Array<{
+    external_call_id: string; customer_name: string; agent_name: string; urgency_level: string; status: string;
+    issue_category: string | null; short_description: string | null; alert_created_at: string;
+  }>> {
+    const result = await this.pool.query(
+      `SELECT c.external_call_id, coalesce(cu.name, cu.external_id) AS customer_name, a.name AS agent_name,
+         ma.urgency_level, ma.status, c.issue_category, c.short_description, ma.created_at AS alert_created_at
+       FROM manager_alerts ma
+       JOIN call_recordings c ON c.id = ma.call_recording_id
+       JOIN agents a ON a.id = c.agent_id
+       JOIN customers cu ON cu.id = c.customer_id
+       WHERE ($1::text IS NULL AND ma.status IN ('OPEN','IN_REVIEW') OR ma.status = $1)
+         AND ($2::text IS NULL OR ma.urgency_level = $2)
+       ORDER BY CASE ma.urgency_level WHEN 'CRITICAL' THEN 0 WHEN 'HIGH' THEN 1 WHEN 'MEDIUM' THEN 2 ELSE 3 END,
+         ma.created_at ASC
+       LIMIT $3`,
+      [status, urgencyLevel, limit]
+    );
+    return result.rows.map((row) => ({
+      external_call_id: String(row.external_call_id), customer_name: String(row.customer_name),
+      agent_name: String(row.agent_name), urgency_level: String(row.urgency_level), status: String(row.status),
+      issue_category: row.issue_category ?? null, short_description: row.short_description ?? null,
+      alert_created_at: String(row.alert_created_at)
+    }));
+  }
+
+  /** Meta/operational overview — how much data exists and whether ingestion is healthy. Not scoped to a
+   *  date range on purpose: this answers "how much data do we have," not a filtered analytics question. */
+  async getDataOverview(): Promise<{
+    total_calls: number; earliest_call_at: string | null; latest_call_at: string | null;
+    total_agents: number; total_customers: number; total_batches: number;
+    batches_in_progress: number; batches_failed: number; calls_pending_processing: number;
+  }> {
+    const [calls, agents, customers, batches, pending] = await Promise.all([
+      this.pool.query(`SELECT count(*)::int AS total, min(started_at) AS earliest, max(started_at) AS latest FROM call_recordings`),
+      this.pool.query(`SELECT count(*)::int AS total FROM agents`),
+      this.pool.query(`SELECT count(*)::int AS total FROM customers`),
+      this.pool.query(
+        `SELECT count(*)::int AS total,
+           count(*) FILTER (WHERE processing_state NOT IN ('COMPLETED','COMPLETED_WITH_FAILURES','FAILED','CANCELLED'))::int AS in_progress,
+           count(*) FILTER (WHERE processing_state = 'FAILED')::int AS failed
+         FROM upload_batches`
+      ),
+      this.pool.query(
+        `SELECT count(*)::int AS total FROM call_recordings
+         WHERE transcription_status <> 'COMPLETED' OR analysis_status <> 'COMPLETED'`
+      )
+    ]);
+    const callsRow = calls.rows[0] as Record<string, unknown>;
+    const batchesRow = batches.rows[0] as Record<string, unknown>;
+    return {
+      total_calls: number(callsRow.total), earliest_call_at: callsRow.earliest ? String(callsRow.earliest) : null,
+      latest_call_at: callsRow.latest ? String(callsRow.latest) : null,
+      total_agents: number((agents.rows[0] as Record<string, unknown>).total),
+      total_customers: number((customers.rows[0] as Record<string, unknown>).total),
+      total_batches: number(batchesRow.total), batches_in_progress: number(batchesRow.in_progress),
+      batches_failed: number(batchesRow.failed),
+      calls_pending_processing: number((pending.rows[0] as Record<string, unknown>).total)
+    };
+  }
+
   async getCallEvidence(filters: {
     agentName?: string; resolutionStatus?: string; issueCategory?: string;
     etiquetteRuleFailed?: EtiquetteRule; dateFrom?: string; dateTo?: string;
+    customerName?: string; externalCallId?: string;
   }, limit: number): Promise<Array<{
     external_call_id: string; title: string | null; short_description: string | null;
-    resolution_status: string; quality_feedback: string | null; agent_name: string;
+    resolution_status: string; quality_feedback: string | null; agent_name: string; customer_name: string;
   }>> {
     const result = await this.pool.query(
       `SELECT c.external_call_id, c.title, c.short_description, c.resolution_status,
-         c.quality_feedback, a.name AS agent_name
+         c.quality_feedback, a.name AS agent_name, coalesce(cu.name, cu.external_id) AS customer_name
        FROM call_recordings c
        JOIN agents a ON a.id = c.agent_id
+       JOIN customers cu ON cu.id = c.customer_id
        LEFT JOIN call_evaluations e ON e.call_recording_id = c.id
        WHERE ($1::text IS NULL OR a.name ILIKE '%'||$1||'%' OR a.external_id = $1)
          AND ($2::text IS NULL OR c.resolution_status = $2)
@@ -321,14 +413,18 @@ export class ChatRepository {
          AND ($4::text IS NULL OR (to_jsonb(e) ->> $4)::boolean = false)
          AND ($5::timestamptz IS NULL OR c.started_at >= $5)
          AND ($6::timestamptz IS NULL OR c.started_at <= $6)
+         AND ($8::text IS NULL OR cu.name ILIKE '%'||$8||'%' OR cu.external_id = $8)
+         AND ($9::text IS NULL OR c.external_call_id = $9)
        ORDER BY c.started_at DESC LIMIT $7`,
       [filters.agentName ?? null, filters.resolutionStatus ?? null, filters.issueCategory ?? null,
-        filters.etiquetteRuleFailed ?? null, filters.dateFrom ?? null, filters.dateTo ?? null, limit]
+        filters.etiquetteRuleFailed ?? null, filters.dateFrom ?? null, filters.dateTo ?? null, limit,
+        filters.customerName ?? null, filters.externalCallId ?? null]
     );
     return result.rows.map((row) => ({
       external_call_id: String(row.external_call_id), title: row.title ?? null,
       short_description: row.short_description ?? null, resolution_status: String(row.resolution_status),
-      quality_feedback: row.quality_feedback ?? null, agent_name: String(row.agent_name)
+      quality_feedback: row.quality_feedback ?? null, agent_name: String(row.agent_name),
+      customer_name: String(row.customer_name)
     }));
   }
 

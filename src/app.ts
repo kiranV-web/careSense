@@ -328,7 +328,7 @@ export function createApp(config: Config, repository: Repository, transcriptionR
   app.post('/api/v1/chat/messages', async (request, response) => {
     const body = chatMessagesBody.parse(request.body);
     const result = await chatService.answer(body.messages);
-    response.json({ answer: result.answer, cited_external_call_ids: result.cited_external_call_ids });
+    response.json({ answer: result.answer, cited_external_call_ids: result.cited_external_call_ids, table: result.table });
   });
   app.use((error: unknown, _request: express.Request, response: express.Response,
     _next: express.NextFunction) => {
