@@ -23,4 +23,16 @@ describe('grouped call list', () => {
     expect(result.items[0]).toMatchObject({ item_type: 'RECURRING_GROUP', call_count: 3, calls });
     expect(String(query.mock.calls[1]![0])).toContain('ORDER BY m.sequence_number');
   });
+
+  it('includes attention calls and their recurring group rows in the attention filter', async () => {
+    const query = vi.fn().mockResolvedValueOnce({ rows: [] });
+    const repository = new CallRepository({ query } as unknown as pg.Pool);
+
+    await repository.listGrouped(1, 15, undefined, undefined, 'attention');
+
+    const sql = String(query.mock.calls[0]![0]);
+    expect(sql).toContain('c.needs_manager_attention');
+    expect(sql).toContain('attention_member.recurring_group_id=g.id');
+    expect(sql).toContain('attention_call.needs_manager_attention');
+  });
 });

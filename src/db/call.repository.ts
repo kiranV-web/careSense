@@ -29,10 +29,11 @@ export type GroupedCallStatusFilter = 'resolved' | 'improve_quality' | 'recurrin
   | 'unresolved' | 'analysis_failed' | 'dropped' | 'rude';
 
 /**
- * Mirrors the frontend's status-derivation priority chain exactly (see
- * callStatusFromBackend/statusFromRecurringOutcome in mappers.ts): a failed
- * analysis always displays as "analysis-failed" regardless of resolution
- * status, DROPPED beats RECURRING, etc. Calls and recurring groups use
+ * Mirrors the frontend's status-derivation priority chain for individual
+ * statuses (see callStatusFromBackend/statusFromRecurringOutcome in
+ * mappers.ts). The attention filter is intentionally cross-cutting: it
+ * returns every manager-attention call regardless of its display status.
+ * Calls and recurring groups use
  * different status columns (call_recordings vs. recurring_call_groups),
  * so each filter needs a clause for both branches of the calls-grouped
  * UNION — groups have no needs_manager_attention/analysis_status/rude
@@ -40,7 +41,7 @@ export type GroupedCallStatusFilter = 'resolved' | 'improve_quality' | 'recurrin
  * client-side behavior exactly.
  */
 function groupedFilterClauses(filter: GroupedCallStatusFilter | undefined): { callClause: string; groupClause: string } {
-  // Each call clause explicitly excludes every higher-priority category in the
+  // Except for the cross-cutting attention filter, each call clause explicitly excludes every higher-priority category in the
   // chain (DROPPED > RECURRING > IMPROVE_QUALITY > ATTENTION > RESOLVED >
   // everything else = UNRESOLVED), not just its own positive condition —
   // otherwise a call matching two conditions (e.g. RESOLVED_BUT_IMPROVE_QUALITY
@@ -66,8 +67,12 @@ function groupedFilterClauses(filter: GroupedCallStatusFilter | undefined): { ca
       };
     case 'attention':
       return {
-        callClause: `${notFailed} AND ${notDropped} AND ${notRecurring} AND ${notImproveQuality} AND c.needs_manager_attention`,
-        groupClause: 'false'
+        callClause: `c.needs_manager_attention`,
+        groupClause: `EXISTS (
+          SELECT 1 FROM recurring_call_members attention_member
+          JOIN call_recordings attention_call ON attention_call.id=attention_member.call_recording_id
+          WHERE attention_member.recurring_group_id=g.id AND attention_call.needs_manager_attention
+        )`
       };
     case 'resolved':
       return {
