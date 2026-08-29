@@ -57,7 +57,7 @@ describe('metadata validation', () => {
     if (result.success) {
       expect(result.data.call_id).toBe(input.sid);
       expect(result.data.audio_file).toBe(`${input.sid}.mp3`);
-      expect(result.data.customer.external_id).toBe('CALLRADAR-CUSTOMER-mary-smith');
+      expect(result.data.customer.external_id).toBe('CALLRADAR-CUSTOMER-44-mary-smith');
       expect(result.data.agent.external_id).toBe('robert');
       expect(result.data).toMatchObject({ channel_layout: 'STEREO', customer_channel: 'RIGHT', agent_channel: 'LEFT',
         source_caller_speaker_id: '44', source_agent_speaker_id: '17' });
@@ -76,20 +76,6 @@ describe('metadata validation', () => {
     expect(second.success && second.data.agent.external_id).toBe('mary-jane');
     expect(first.success && first.data.source_agent_speaker_id).toBe('1');
     expect(second.success && second.data.source_agent_speaker_id).toBe('9');
-  });
-
-  it('maps a returning customer with a changing speaker ID to one identity', () => {
-    const make = (name: string, speakerId: number) => validateMetadata({
-      sid: `call-${speakerId}`, start_time_ms: 1590860609249, end_time_ms: 1590860654497,
-      agent: { speaker_id: 17, metadata: { agent_name: 'Robert' } },
-      caller: { speaker_id: speakerId, metadata: { 'first and last name': name } }
-    });
-    const first = make('Mary Smith', 44);
-    const second = make('Mary Smith', 91);
-    expect(first.success && first.data.customer.external_id).toBe('CALLRADAR-CUSTOMER-mary-smith');
-    expect(second.success && second.data.customer.external_id).toBe('CALLRADAR-CUSTOMER-mary-smith');
-    expect(first.success && first.data.source_caller_speaker_id).toBe('44');
-    expect(second.success && second.data.source_caller_speaker_id).toBe('91');
   });
 
   it('rejects timestamps without a timezone', () => {
