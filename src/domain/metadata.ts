@@ -161,7 +161,11 @@ export function validateMetadata(input: unknown, defaultLanguage = 'en'): Metada
       channel_layout: 'STEREO', customer_channel: 'RIGHT', agent_channel: 'LEFT',
       source_caller_speaker_id: String(value.caller.speaker_id),
       source_agent_speaker_id: String(value.agent.speaker_id),
-      customer: { external_id: `CALLRADAR-CUSTOMER-${value.caller.speaker_id}-${identityKey(customerName)}`, name: customerName,
+      // speaker_id is a per-call diarization channel label, not a stable customer
+      // identifier — it changes every time the same customer calls again, so it
+      // must stay out of the identity key (mirrors the agent line below, which
+      // already keys on name alone).
+      customer: { external_id: `CALLRADAR-CUSTOMER-${identityKey(customerName)}`, name: customerName,
         raw_metadata: asRecord(value.caller) },
       agent: { external_id: identityKey(agentName), name: agentName,
         raw_metadata: asRecord(value.agent) },
