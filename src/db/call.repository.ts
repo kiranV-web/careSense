@@ -32,7 +32,8 @@ export type GroupedCallStatusFilter = 'resolved' | 'improve_quality' | 'recurrin
  * Mirrors the frontend's status-derivation priority chain for individual
  * statuses (see callStatusFromBackend/statusFromRecurringOutcome in
  * mappers.ts). The attention filter is intentionally cross-cutting: it
- * returns every manager-attention call regardless of its display status.
+ * returns the union of recurring, rude and unresolved calls represented by
+ * the homepage's Requires attention tile.
  * Calls and recurring groups use
  * different status columns (call_recordings vs. recurring_call_groups),
  * so each filter needs a clause for both branches of the calls-grouped
@@ -67,12 +68,12 @@ function groupedFilterClauses(filter: GroupedCallStatusFilter | undefined): { ca
       };
     case 'attention':
       return {
-        callClause: `c.needs_manager_attention`,
-        groupClause: `EXISTS (
-          SELECT 1 FROM recurring_call_members attention_member
-          JOIN call_recordings attention_call ON attention_call.id=attention_member.call_recording_id
-          WHERE attention_member.recurring_group_id=g.id AND attention_call.needs_manager_attention
-        )`
+        callClause: `${notFailed} AND (
+          'RECURRING'=ANY(c.call_statuses)
+          OR 'RUDE'=ANY(c.call_statuses)
+          OR c.resolution_status='UNRESOLVED'
+        )`,
+        groupClause: 'true'
       };
     case 'resolved':
       return {
