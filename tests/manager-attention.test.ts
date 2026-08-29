@@ -48,52 +48,76 @@ describe('calculateManagerAttention', () => {
     expect(calculateManagerAttention(call({ id: 'a' }))).toBeNull();
   });
 
-  it('scores a rude call at the 90 base with no additions when nothing else applies', () => {
-    const now = new Date('2026-01-01T01:00:00Z');
-    const result = calculateManagerAttention(call({ id: 'a', call_statuses: ['RUDE'] }), now);
-    expect(result?.score).toBe(90);
-    expect(result?.urgency_label).toBe('Critical');
+  it('scores a rude call at 50 with no other factors', () => {
+    const result = calculateManagerAttention(call({ id: 'a', call_statuses: ['RUDE'] }));
+    expect(result?.score).toBe(50);
+    expect(result?.urgency_label).toBe('Elevated review');
     expect(result?.primary_reason).toBe('Rude call');
-    expect(result?.factors[0]).toEqual({ label: 'Base priority: Rude call', value: 90, kind: 'BASE' });
+    expect(result?.factors).toEqual([{ label: 'Rude call', value: 50, kind: 'ADDITION' }]);
+    expect(result?.additional_reasons).toEqual([]);
   });
 
-  it('prioritizes recurring+unresolved over recurring alone', () => {
-    const now = new Date('2026-01-01T01:00:00Z');
-    const result = calculateManagerAttention(call({ id: 'a', call_statuses: ['RECURRING'], resolution_status: 'UNRESOLVED' }), now);
-    expect(result?.primary_reason).toBe('Recurring unresolved');
-    expect(result?.score).toBe(82);
+  it('scores a recurring call at 15', () => {
+    const result = calculateManagerAttention(call({ id: 'a', call_statuses: ['RECURRING'] }));
+    expect(result?.score).toBe(15);
+    expect(result?.primary_reason).toBe('Recurring call');
   });
 
-  it('adds SLA-overdue points once a call has been open 12+ hours', () => {
-    const now = new Date('2026-01-01T13:00:00Z');
-    const result = calculateManagerAttention(call({ id: 'a', resolution_status: 'UNRESOLVED', started_at: '2026-01-01T00:00:00Z' }), now);
-    expect(result?.waiting_hours).toBe(13);
-    expect(result?.additional_reasons).toContain('SLA overdue');
-    expect(result?.score).toBe(75 + 5 + 2);
+  it('scores an unresolved call at 30, and treats escalated the same as unresolved', () => {
+    const unresolved = calculateManagerAttention(call({ id: 'a', resolution_status: 'UNRESOLVED' }));
+    expect(unresolved?.score).toBe(30);
+    expect(unresolved?.primary_reason).toBe('Unresolved');
+
+    const escalated = calculateManagerAttention(call({ id: 'a', resolution_status: 'ESCALATED' }));
+    expect(escalated?.score).toBe(30);
+    expect(escalated?.primary_reason).toBe('Unresolved');
   });
 
-  it('does not add SLA-overdue points before 12 hours have elapsed', () => {
-    const now = new Date('2026-01-01T05:00:00Z');
-    const result = calculateManagerAttention(call({ id: 'a', resolution_status: 'UNRESOLVED', started_at: '2026-01-01T00:00:00Z' }), now);
-    expect(result?.additional_reasons).not.toContain('SLA overdue');
-    expect(result?.score).toBe(75);
+  it('scores missed etiquette rules as 30 base + 5 per rule', () => {
+    const result = calculateManagerAttention(call({
+      id: 'a', resolution_status: 'RESOLVED_BUT_IMPROVE_QUALITY', missed_etiquette_count: 3
+    }));
+    expect(result?.score).toBe(30 + 5 * 3);
+    expect(result?.primary_reason).toBe('Etiquette missed (3 rules)');
+    expect(result?.factors).toEqual([{ label: 'Etiquette missed (3 rules)', value: 45, kind: 'ADDITION' }]);
   });
 
-  it('prefers manager_alert_created_at over started_at for the waiting clock', () => {
+  it('uses singular wording for exactly one missed rule', () => {
+    const result = calculateManagerAttention(call({
+      id: 'a', resolution_status: 'RESOLVED_BUT_IMPROVE_QUALITY', missed_etiquette_count: 1
+    }));
+    expect(result?.primary_reason).toBe('Etiquette missed (1 rule)');
+    expect(result?.score).toBe(35);
+  });
+
+  it('sums every applicable factor and picks the highest as the primary reason', () => {
+    const result = calculateManagerAttention(call({
+      id: 'a', call_statuses: ['RUDE', 'RECURRING'], resolution_status: 'UNRESOLVED', missed_etiquette_count: 2
+    }));
+    // 50 (rude) + 30 (unresolved) + 40 (30 + 5*2 etiquette) + 15 (recurring) = 135, capped at 99
+    expect(result?.score).toBe(99);
+    expect(result?.primary_reason).toBe('Rude call');
+    expect(result?.additional_reasons).toEqual(
+      expect.arrayContaining(['Unresolved', 'Etiquette missed (2 rules)', 'Recurring call'])
+    );
+    expect(result?.additional_reasons).toHaveLength(3);
+  });
+
+  it('never returns a score of 100 or above', () => {
+    const result = calculateManagerAttention(call({
+      id: 'a', call_statuses: ['RUDE', 'RECURRING'], resolution_status: 'UNRESOLVED', missed_etiquette_count: 7
+    }));
+    expect(result?.score).toBeLessThanOrEqual(99);
+  });
+
+  it('still computes waiting_hours from manager_alert_created_at for display, without affecting the score', () => {
     const now = new Date('2026-01-02T00:00:00Z');
     const result = calculateManagerAttention(call({
-      id: 'a', resolution_status: 'UNRESOLVED', started_at: '2026-01-01T00:00:00Z',
+      id: 'a', call_statuses: ['RUDE'], started_at: '2026-01-01T00:00:00Z',
       manager_alert_created_at: '2026-01-01T23:00:00Z'
     }), now);
     expect(result?.waiting_hours).toBe(1);
-  });
-
-  it('caps the final score at 100', () => {
-    const now = new Date('2026-01-02T00:00:00Z');
-    const result = calculateManagerAttention(call({
-      id: 'a', call_statuses: ['RUDE', 'RECURRING'], resolution_status: 'UNRESOLVED', started_at: '2026-01-01T00:00:00Z'
-    }), now);
-    expect(result?.score).toBe(100);
+    expect(result?.score).toBe(50);
   });
 });
 

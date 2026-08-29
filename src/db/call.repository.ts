@@ -27,6 +27,16 @@ const processingStateSql = `CASE
   WHEN c.recurrence_status IN ('PENDING','QUEUED','LINKING') THEN 'LINKING_RECURRING_CALLS'
   ELSE 'COMPLETED' END`;
 
+const missedEtiquetteCountSql = `(
+  CASE WHEN NOT coalesce(e.greeted_customer,true) THEN 1 ELSE 0 END +
+  CASE WHEN NOT coalesce(e.introduced_self,true) THEN 1 ELSE 0 END +
+  CASE WHEN coalesce(e.showed_empathy_applicable,false) AND NOT coalesce(e.showed_empathy,true) THEN 1 ELSE 0 END +
+  CASE WHEN NOT coalesce(e.offered_help,true) THEN 1 ELSE 0 END +
+  CASE WHEN NOT coalesce(e.provided_clear_guidance,true) THEN 1 ELSE 0 END +
+  CASE WHEN NOT coalesce(e.thanked_customer,true) THEN 1 ELSE 0 END +
+  CASE WHEN NOT coalesce(e.wished_customer_good_day,true) THEN 1 ELSE 0 END
+)::int`;
+
 const callLoggedCustomerNameSql = `coalesce(
   nullif(btrim(c.raw_metadata #>> '{caller,metadata,first and last name}'),''),
   nullif(btrim(c.raw_metadata #>> '{caller,metadata,first_and_last_name}'),''),cu.name)`;
@@ -114,9 +124,11 @@ export class CallRepository {
        cu.id AS customer_id,coalesce(nullif(btrim(c.source_caller_speaker_id),''),cu.external_id) AS customer_external_id,
        ${callLoggedCustomerNameSql} AS customer_name,
        a.id AS agent_id,a.external_id AS agent_external_id,a.name AS agent_name,
-       ma.status AS manager_alert_status,ma.created_at AS manager_alert_created_at
+       ma.status AS manager_alert_status,ma.created_at AS manager_alert_created_at,
+       ${missedEtiquetteCountSql} AS missed_etiquette_count
        FROM call_recordings c JOIN customers cu ON cu.id=c.customer_id JOIN agents a ON a.id=c.agent_id
        LEFT JOIN transcripts t ON t.call_recording_id=c.id LEFT JOIN manager_alerts ma ON ma.call_recording_id=c.id
+       LEFT JOIN call_evaluations e ON e.call_recording_id=c.id
        WHERE c.analysis_status<>'FAILED'`
     );
     return rankAttentionCalls(result.rows as Array<Record<string, unknown> & ManagerAttentionInput>);
@@ -127,7 +139,8 @@ export class CallRepository {
   }> {
     const ranked = await this.rankedAttentionCalls();
     const items = ranked.slice((page - 1) * pageSize, page * pageSize).map((row) => {
-      const { manager_alert_status: _status, manager_alert_created_at: _created, ...item } = row;
+      const { manager_alert_status: _status, manager_alert_created_at: _created,
+        missed_etiquette_count: _missed, ...item } = row;
       return withResolutionAliases({ ...item, item_type: 'CALL' });
     });
     return {
@@ -138,13 +151,13 @@ export class CallRepository {
 
   async getAttentionSummary(): Promise<Record<string, unknown>> {
     const ranked = await this.rankedAttentionCalls();
-    const categories = { rude: 0, recurring_unresolved: 0, unresolved: 0, quality_reviews: 0, other: 0 };
+    const categories = { rude: 0, unresolved: 0, etiquette_issues: 0, recurring: 0, other: 0 };
     for (const call of ranked) {
       const reason = call.manager_attention.primary_reason;
       if (reason === 'Rude call') categories.rude += 1;
-      else if (reason === 'Recurring unresolved' || reason === 'Recurring issue') categories.recurring_unresolved += 1;
-      else if (reason === 'Unresolved' || reason === 'Escalated call') categories.unresolved += 1;
-      else if (reason === 'Quality review') categories.quality_reviews += 1;
+      else if (reason === 'Unresolved') categories.unresolved += 1;
+      else if (reason.startsWith('Etiquette missed')) categories.etiquette_issues += 1;
+      else if (reason === 'Recurring call') categories.recurring += 1;
       else categories.other += 1;
     }
     return { total: ranked.length, highest: ranked[0]?.manager_attention ?? null, categories };
