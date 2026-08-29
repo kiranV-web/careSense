@@ -175,7 +175,8 @@ export class AnalysisRepository {
         if (result.needs_manager_attention) {
           await client.query(
             `INSERT INTO manager_alerts (call_recording_id,urgency_level) VALUES ($1,$2)
-             ON CONFLICT (call_recording_id) DO UPDATE SET urgency_level=EXCLUDED.urgency_level,updated_at=now()`,
+             ON CONFLICT (call_recording_id) DO UPDATE SET urgency_level=EXCLUDED.urgency_level,status='OPEN',
+             reviewed_at=NULL,updated_at=now()`,
             [result.call_id, result.urgency_level]
           );
         } else {

@@ -57,7 +57,7 @@ describe('metadata validation', () => {
     if (result.success) {
       expect(result.data.call_id).toBe(input.sid);
       expect(result.data.audio_file).toBe(`${input.sid}.mp3`);
-      expect(result.data.customer.external_id).toBe('CALLRADAR-CUSTOMER-44-mary-smith');
+      expect(result.data.customer.external_id).toBe('CALLRADAR-CUSTOMER-44');
       expect(result.data.agent.external_id).toBe('robert');
       expect(result.data).toMatchObject({ channel_layout: 'STEREO', customer_channel: 'RIGHT', agent_channel: 'LEFT',
         source_caller_speaker_id: '44', source_agent_speaker_id: '17' });

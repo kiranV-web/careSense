@@ -41,6 +41,10 @@ const groupedCallListQuery = z.object({
   started_from: z.string().datetime({ offset: true }).optional(),
   started_to: z.string().datetime({ offset: true }).optional()
 }).strict();
+const customerListQuery = z.object({
+  search: z.string().trim().min(1).max(200).optional(), ...pagination
+}).strict();
+const customerCallsQuery = z.object({ ...pagination }).strict();
 const managerListQuery = z.object({
   status: z.enum(['OPEN', 'IN_REVIEW', 'CLOSED']).optional(), urgency_level: z.enum(urgencyLevels).optional(), ...pagination
 }).strict();
@@ -239,9 +243,27 @@ export function createApp(config: Config, repository: Repository, transcriptionR
   });
   app.get('/api/v1/calls-grouped', async (request, response) => {
     const query = groupedCallListQuery.parse(request.query);
+    if (query.status_filter === 'attention') {
+      response.json(await callRepository.listAttentionQueue(query.page, query.page_size));
+      return;
+    }
     response.json(await callRepository.listGrouped(
       query.page, query.page_size, query.started_from, query.started_to, query.status_filter
     ));
+  });
+  app.get('/api/v1/manager-attention/summary', async (_request, response) => {
+    response.json(await callRepository.getAttentionSummary());
+  });
+  app.get('/api/v1/customers', async (request, response) => {
+    const query = customerListQuery.parse(request.query);
+    response.json(await callRepository.listCustomers(query.search, query.page, query.page_size));
+  });
+  app.get('/api/v1/customers/:customerId', async (request, response) => {
+    const customerId = z.string().trim().min(1).max(255).parse(request.params.customerId);
+    const query = customerCallsQuery.parse(request.query);
+    const customer = await callRepository.getCustomerCalls(customerId, query.page, query.page_size);
+    if (!customer) response.status(404).json({ error: 'Customer not found' });
+    else response.json(customer);
   });
   app.get('/api/v1/recurring-groups/:groupId', async (request, response) => {
     const groupId = z.string().uuid().parse(request.params.groupId);

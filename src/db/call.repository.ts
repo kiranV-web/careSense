@@ -1,8 +1,10 @@
 import type pg from 'pg';
+import { rankAttentionCalls, type ManagerAttentionInput, type ManagerAttentionResult } from '../services/managerAttention.js';
 
 export interface CallListFilters {
   batchId?: string;
   customerId?: string;
+  callerId?: string;
   agentId?: string;
   issueCategory?: string;
   deviceModel?: string;
@@ -24,6 +26,10 @@ const processingStateSql = `CASE
   WHEN c.analysis_status IN ('PENDING','QUEUED','ANALYZING') THEN 'ANALYZING'
   WHEN c.recurrence_status IN ('PENDING','QUEUED','LINKING') THEN 'LINKING_RECURRING_CALLS'
   ELSE 'COMPLETED' END`;
+
+const callLoggedCustomerNameSql = `coalesce(
+  nullif(btrim(c.raw_metadata #>> '{caller,metadata,first and last name}'),''),
+  nullif(btrim(c.raw_metadata #>> '{caller,metadata,first_and_last_name}'),''),cu.name)`;
 
 export type GroupedCallStatusFilter = 'resolved' | 'improve_quality' | 'recurring' | 'attention'
   | 'unresolved' | 'analysis_failed' | 'dropped' | 'rude';
@@ -97,6 +103,141 @@ function groupedFilterClauses(filter: GroupedCallStatusFilter | undefined): { ca
 export class CallRepository {
   constructor(private readonly pool: pg.Pool) {}
 
+  private async rankedAttentionCalls() {
+    const result = await this.pool.query(
+      `SELECT c.id,c.external_call_id,c.batch_id,c.started_at,c.language,
+       coalesce(nullif(btrim(c.device_model),''),'GENERAL') AS device_model,
+       coalesce(nullif(btrim(c.banking_product),''),'GENERAL_BANKING') AS banking_product,t.duration_seconds,
+       c.title,c.short_description,c.issue_category,c.issue_cause,c.customer_problem,c.resolution_status,c.quality_feedback,c.call_statuses,
+       c.needs_manager_attention,c.urgency_level,${processingStateSql} AS processing_state,
+       c.transcription_status,c.analysis_status,c.recurrence_status,
+       cu.id AS customer_id,coalesce(nullif(btrim(c.source_caller_speaker_id),''),cu.external_id) AS customer_external_id,
+       ${callLoggedCustomerNameSql} AS customer_name,
+       a.id AS agent_id,a.external_id AS agent_external_id,a.name AS agent_name,
+       ma.status AS manager_alert_status,ma.created_at AS manager_alert_created_at
+       FROM call_recordings c JOIN customers cu ON cu.id=c.customer_id JOIN agents a ON a.id=c.agent_id
+       LEFT JOIN transcripts t ON t.call_recording_id=c.id LEFT JOIN manager_alerts ma ON ma.call_recording_id=c.id
+       WHERE c.analysis_status<>'FAILED'`
+    );
+    return rankAttentionCalls(result.rows as Array<Record<string, unknown> & ManagerAttentionInput>);
+  }
+
+  async listAttentionQueue(page: number, pageSize: number): Promise<{
+    items: Record<string, unknown>[]; pagination: Record<string, number>
+  }> {
+    const ranked = await this.rankedAttentionCalls();
+    const items = ranked.slice((page - 1) * pageSize, page * pageSize).map((row) => {
+      const { manager_alert_status: _status, manager_alert_created_at: _created, ...item } = row;
+      return withResolutionAliases({ ...item, item_type: 'CALL' });
+    });
+    return {
+      items,
+      pagination: { page, page_size: pageSize, total: ranked.length, total_pages: Math.ceil(ranked.length / pageSize) }
+    };
+  }
+
+  async getAttentionSummary(): Promise<Record<string, unknown>> {
+    const ranked = await this.rankedAttentionCalls();
+    const categories = { rude: 0, recurring_unresolved: 0, unresolved: 0, quality_reviews: 0, other: 0 };
+    for (const call of ranked) {
+      const reason = call.manager_attention.primary_reason;
+      if (reason === 'Rude call') categories.rude += 1;
+      else if (reason === 'Recurring unresolved' || reason === 'Recurring issue') categories.recurring_unresolved += 1;
+      else if (reason === 'Unresolved' || reason === 'Escalated call') categories.unresolved += 1;
+      else if (reason === 'Quality review') categories.quality_reviews += 1;
+      else categories.other += 1;
+    }
+    return { total: ranked.length, highest: ranked[0]?.manager_attention ?? null, categories };
+  }
+
+  async getAttentionContext(callId: string): Promise<ManagerAttentionResult | null> {
+    const ranked = await this.rankedAttentionCalls();
+    return ranked.find((call) => call.id === callId)?.manager_attention ?? null;
+  }
+
+  async listCustomers(search: string | undefined, page: number, pageSize: number): Promise<{
+    items: Record<string, unknown>[]; pagination: Record<string, number>
+  }> {
+    const offset = (page - 1) * pageSize;
+    const result = await this.pool.query(
+      `WITH identified_calls AS (
+         SELECT c.*,coalesce(nullif(btrim(c.source_caller_speaker_id),''),cu.external_id) AS caller_id,
+         coalesce(nullif(btrim(c.raw_metadata #>> '{caller,metadata,first and last name}'),''),
+           nullif(btrim(c.raw_metadata #>> '{caller,metadata,first_and_last_name}'),''),cu.name) AS logged_name
+         FROM call_recordings c JOIN customers cu ON cu.id=c.customer_id
+       ), customer_summary AS (
+         SELECT c.caller_id AS id,c.caller_id AS external_id,
+         coalesce(array_agg(DISTINCT c.logged_name ORDER BY c.logged_name)
+           FILTER (WHERE c.logged_name IS NOT NULL),'{}'::text[]) AS logged_names,
+         count(c.id)::integer AS call_count,
+         count(c.id) FILTER (WHERE c.resolution_status='RESOLVED')::integer AS resolved_count,
+         count(c.id) FILTER (WHERE c.resolution_status='RESOLVED_BUT_IMPROVE_QUALITY')::integer AS improve_quality_count,
+         count(c.id) FILTER (WHERE c.needs_manager_attention OR 'RECURRING'=ANY(c.call_statuses)
+           OR 'RUDE'=ANY(c.call_statuses) OR c.resolution_status IN ('UNRESOLVED','ESCALATED'))::integer AS attention_count,
+         count(c.id) FILTER (WHERE c.resolution_status='DROPPED')::integer AS dropped_count,
+         coalesce(sum(t.duration_seconds),0) AS total_duration_seconds,max(c.started_at) AS latest_call_at
+         FROM identified_calls c LEFT JOIN transcripts t ON t.call_recording_id=c.id
+         WHERE ($1::text IS NULL OR c.caller_id ILIKE '%' || $1 || '%' OR c.logged_name ILIKE '%' || $1 || '%')
+         GROUP BY c.caller_id
+       )
+       SELECT *,count(*) OVER()::integer AS total_count FROM customer_summary
+       ORDER BY latest_call_at DESC NULLS LAST,external_id LIMIT $2 OFFSET $3`, [search ?? null, pageSize, offset]
+    );
+    const callerIds = result.rows.map((row: Record<string, unknown>) => row.id as string);
+    const activity = callerIds.length === 0 ? { rows: [] as Record<string, unknown>[] } : await this.pool.query(
+      `WITH identified_calls AS (
+         SELECT c.*,coalesce(nullif(btrim(c.source_caller_speaker_id),''),cu.external_id) AS caller_id
+         FROM call_recordings c JOIN customers cu ON cu.id=c.customer_id
+       ), ranked AS (
+         SELECT c.id,c.caller_id AS customer_id,c.agent_id,c.external_call_id,c.started_at,c.resolution_status,c.call_statuses,
+         c.needs_manager_attention,row_number() OVER (PARTITION BY c.caller_id ORDER BY c.started_at DESC,c.id DESC) AS position
+         FROM identified_calls c WHERE c.caller_id=ANY($1::text[])
+       )
+       SELECT id,customer_id,agent_id,external_call_id,started_at,resolution_status,call_statuses,needs_manager_attention
+       FROM ranked WHERE position<=28 ORDER BY customer_id,started_at,id`, [callerIds]
+    );
+    const activityByCustomer = new Map<string, Record<string, unknown>[]>();
+    for (const row of activity.rows) {
+      const customerId = row.customer_id as string;
+      const calls = activityByCustomer.get(customerId) ?? [];
+      calls.push(withResolutionAliases(row));
+      activityByCustomer.set(customerId, calls);
+    }
+    const total = Number(result.rows[0]?.total_count ?? 0);
+    return {
+      items: result.rows.map((row: Record<string, unknown>) => {
+        const { total_count: _total, ...customer } = row;
+        return { ...customer, activity: activityByCustomer.get(row.id as string) ?? [] };
+      }),
+      pagination: { page, page_size: pageSize, total, total_pages: Math.ceil(total / pageSize) }
+    };
+  }
+
+  async getCustomerCalls(callerId: string, page: number, pageSize: number): Promise<Record<string, unknown> | undefined> {
+    const result = await this.pool.query(
+      `WITH identified_calls AS (
+         SELECT c.*,coalesce(nullif(btrim(c.source_caller_speaker_id),''),cu.external_id) AS caller_id,
+         coalesce(nullif(btrim(c.raw_metadata #>> '{caller,metadata,first and last name}'),''),
+           nullif(btrim(c.raw_metadata #>> '{caller,metadata,first_and_last_name}'),''),cu.name) AS logged_name
+         FROM call_recordings c JOIN customers cu ON cu.id=c.customer_id
+       )
+       SELECT c.caller_id AS id,c.caller_id AS external_id,
+       coalesce(array_agg(DISTINCT c.logged_name ORDER BY c.logged_name)
+         FILTER (WHERE c.logged_name IS NOT NULL),'{}'::text[]) AS logged_names,count(c.id)::integer AS call_count,
+       count(c.id) FILTER (WHERE c.resolution_status='RESOLVED')::integer AS resolved_count,
+       count(c.id) FILTER (WHERE c.resolution_status='RESOLVED_BUT_IMPROVE_QUALITY')::integer AS improve_quality_count,
+       count(c.id) FILTER (WHERE c.needs_manager_attention OR 'RECURRING'=ANY(c.call_statuses)
+         OR 'RUDE'=ANY(c.call_statuses) OR c.resolution_status IN ('UNRESOLVED','ESCALATED'))::integer AS attention_count,
+       count(c.id) FILTER (WHERE c.resolution_status='DROPPED')::integer AS dropped_count,
+       coalesce(sum(t.duration_seconds),0) AS total_duration_seconds,max(c.started_at) AS latest_call_at
+       FROM identified_calls c LEFT JOIN transcripts t ON t.call_recording_id=c.id
+       WHERE c.caller_id=$1 GROUP BY c.caller_id`, [callerId]
+    );
+    if (!result.rows[0]) return undefined;
+    const calls = await this.list({ callerId, page, pageSize });
+    return { customer: result.rows[0], items: calls.items, pagination: calls.pagination };
+  }
+
   async listGrouped(page: number, pageSize: number, startedFrom?: string, startedTo?: string,
     statusFilter?: GroupedCallStatusFilter): Promise<{
     items: Record<string, unknown>[]; pagination: Record<string, number>
@@ -146,7 +287,8 @@ export class CallRepository {
          c.title,c.short_description,c.issue_category,c.issue_cause,c.customer_problem,c.resolution_status,c.quality_feedback,c.call_statuses,
          c.needs_manager_attention,c.urgency_level,${processingStateSql} AS processing_state,
          c.transcription_status,c.analysis_status,c.recurrence_status,
-         cu.id AS customer_id,cu.external_id AS customer_external_id,cu.name AS customer_name,
+         cu.id AS customer_id,coalesce(nullif(btrim(c.source_caller_speaker_id),''),cu.external_id) AS customer_external_id,
+         ${callLoggedCustomerNameSql} AS customer_name,
          a.id AS agent_id,a.external_id AS agent_external_id,a.name AS agent_name
          FROM call_recordings c JOIN customers cu ON cu.id=c.customer_id JOIN agents a ON a.id=c.agent_id
          LEFT JOIN transcripts t ON t.call_recording_id=c.id WHERE c.id=$1`, [entry.id]
@@ -185,6 +327,7 @@ export class CallRepository {
     };
     if (filters.batchId) add('c.batch_id=?', filters.batchId);
     if (filters.customerId) add('c.customer_id=?', filters.customerId);
+    if (filters.callerId) add(`coalesce(nullif(btrim(c.source_caller_speaker_id),''),cu.external_id)=?`, filters.callerId);
     if (filters.agentId) {
       values.push(filters.agentId);
       clauses.push(`(c.agent_id::text=$${values.length} OR a.external_id=$${values.length})`);
@@ -208,7 +351,8 @@ export class CallRepository {
        c.title,c.short_description,c.issue_category,c.issue_cause,c.customer_problem,c.resolution_status,c.quality_feedback,c.call_statuses,
        c.needs_manager_attention,c.urgency_level,${processingStateSql} AS processing_state,
        c.transcription_status,c.analysis_status,c.recurrence_status,
-       cu.id AS customer_id,cu.external_id AS customer_external_id,cu.name AS customer_name,
+       cu.id AS customer_id,coalesce(nullif(btrim(c.source_caller_speaker_id),''),cu.external_id) AS customer_external_id,
+       ${callLoggedCustomerNameSql} AS customer_name,
        a.id AS agent_id,a.external_id AS agent_external_id,a.name AS agent_name,
        count(*) OVER()::integer AS total_count
        FROM call_recordings c JOIN customers cu ON cu.id=c.customer_id JOIN agents a ON a.id=c.agent_id
@@ -238,13 +382,15 @@ export class CallRepository {
        c.needs_manager_attention,c.urgency_level,c.transcription_status,c.transcription_failure_reason,
        c.analysis_status,c.analysis_failure_reason,c.recurrence_status,c.recurrence_failure_reason,
        ${processingStateSql} AS processing_state,
-       cu.id AS customer_id,cu.external_id AS customer_external_id,cu.name AS customer_name,
+       cu.id AS customer_id,coalesce(nullif(btrim(c.source_caller_speaker_id),''),cu.external_id) AS customer_external_id,
+       ${callLoggedCustomerNameSql} AS customer_name,
        a.id AS agent_id,a.external_id AS agent_external_id,a.name AS agent_name,
        t.id AS transcript_id,t.full_text,t.language AS transcript_language,t.duration_seconds,t.segment_count,
        e.greeted_customer,e.introduced_self,e.showed_empathy,e.showed_empathy_applicable,
        e.showed_empathy_reason,e.offered_help,e.provided_clear_guidance,
        e.thanked_customer,e.wished_customer_good_day,
-       ma.id AS manager_alert_id,ma.status AS manager_alert_status,ma.manager_notes,ma.reviewed_at
+       ma.id AS manager_alert_id,ma.status AS manager_alert_status,ma.manager_notes,ma.reviewed_at,
+       ma.created_at AS manager_alert_created_at
        FROM call_recordings c JOIN customers cu ON cu.id=c.customer_id JOIN agents a ON a.id=c.agent_id
        LEFT JOIN transcripts t ON t.call_recording_id=c.id
        LEFT JOIN call_evaluations e ON e.call_recording_id=c.id
@@ -297,15 +443,16 @@ export class CallRepository {
     };
     const managerAlert = row.manager_alert_id ? {
       id: row.manager_alert_id, status: row.manager_alert_status, manager_notes: row.manager_notes,
-      reviewed_at: row.reviewed_at
+      reviewed_at: row.reviewed_at, created_at: row.manager_alert_created_at
     } : null;
     for (const key of ['greeted_customer', 'introduced_self', 'showed_empathy', 'showed_empathy_applicable',
       'showed_empathy_reason', 'offered_help',
       'provided_clear_guidance', 'thanked_customer', 'wished_customer_good_day', 'manager_alert_id',
-      'manager_alert_status', 'manager_notes', 'reviewed_at']) delete row[key];
+      'manager_alert_status', 'manager_notes', 'reviewed_at', 'manager_alert_created_at']) delete row[key];
+    const managerAttention = await this.getAttentionContext(recordingId);
     return { ...row, status: resolutionStatusValue(row.resolution_status),
       status_label: resolutionStatusLabel(row.resolution_status), rules, manager_alert: managerAlert,
-      segments: segmentsResult.rows, recurring_groups: [...groups.values()] };
+      manager_attention: managerAttention, segments: segmentsResult.rows, recurring_groups: [...groups.values()] };
   }
 
   async getAudio(callId: string): Promise<{

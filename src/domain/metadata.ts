@@ -161,7 +161,7 @@ export function validateMetadata(input: unknown, defaultLanguage = 'en'): Metada
       channel_layout: 'STEREO', customer_channel: 'RIGHT', agent_channel: 'LEFT',
       source_caller_speaker_id: String(value.caller.speaker_id),
       source_agent_speaker_id: String(value.agent.speaker_id),
-      customer: { external_id: `CALLRADAR-CUSTOMER-${value.caller.speaker_id}-${identityKey(customerName)}`, name: customerName,
+      customer: { external_id: `CALLRADAR-CUSTOMER-${value.caller.speaker_id}`, name: customerName,
         raw_metadata: asRecord(value.caller) },
       agent: { external_id: identityKey(agentName), name: agentName,
         raw_metadata: asRecord(value.agent) },
