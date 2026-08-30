@@ -91,17 +91,22 @@ Nothing is re-computed on request: transcription, analysis, and recurrence all r
 - ✅ Per customer: every customer, by their caller ID, with full call history — recording + transcript for every call (`GET /api/v1/customers`, `/api/v1/customers/:id`).
 - ✅ Per call: intent (`customer_problem`), mood and where it shifted (per-segment `textual_tone`, timestamped), resolution status, a summary (24 words, under the 40-word cap) — all on `GET /api/v1/calls/:id`.
 - ✅ Ranked "needs a manager's attention today" (`GET /api/v1/calls-grouped?status_filter=attention`, `GET /api/v1/manager-attention/summary`) — see [Scoring](#the-manager-attention-score) below.
-- ✅ Trending issues (`GET /api/v1/recurring-groups/:id`, recurrence stage ④).
 - ✅ Per-agent view — call volumes, handle times, outcomes (`GET /api/v1/dashboard/team`, `GET /api/v1/agents/:id/calls`).
 - ✅ Every judgment cites the moment that justifies it: segment-level `textual_tone` is timestamped, etiquette rule verdicts come with quoted transcript evidence, `customer_problem.evidence` is a transcript excerpt.
 
 **Beyond the brief**
-- Call-volume and issue trends across the whole dataset, not just per customer.
-- An AI coaching insight that reads team-wide etiquette performance and tells a manager what to work on next (`GET /api/v1/dashboard/coaching-insight`).
-- A per-agent etiquette heatmap.
-- A 7-rule etiquette contract every agent is checked against on every call (see below).
-- A chat agent (`POST /api/v1/chat/messages`) — a manager can ask a question in plain English and get an answer sourced from ~20 purpose-built SQL functions over the real data, not a general-purpose free-text model.
-- Uploads survive a page refresh: the upload endpoint returns as soon as the ZIP is fully received; every later stage runs server-side in the queue regardless of whether the browser tab stays open, and progress is re-readable at any time from `GET /api/v1/upload-batches/:batchId`.
+
+- **Resolution isn't the only bar — how the agent behaved matters just as much.** Every call is checked against a 7-rule company etiquette contract (below) *independently* of whether the issue got fixed, because a technically-resolved call handled rudely is still a failure a manager needs to see. And the rules aren't applied blindly: `Empathy` is only marked applicable when the situation actually calls for it — a routine fund-transfer or new-checkbook request isn't marked down for skipping empathy it never needed, while a lost/stolen card or a visibly distressed customer always requires it. That distinction is enforced in the analysis prompt itself, not left to chance.
+- **Recurring-call detection.** Checks whether a caller has called multiple times in the last 10 days about the same issue that's still unresolved, and groups those calls into one recurring-issue view — but only if every call in the window is genuinely about the same matter. If they're not, each stays its own individual call instead of being forced into a group it doesn't belong in.
+- **An AI coach, not just a scoreboard.** `GET /api/v1/dashboard/coaching-insight` reads the whole team's etiquette performance and tells a manager what to actually work on next, in plain language — not just the raw pass/fail numbers.
+- **A chat agent a manager can just ask.** `POST /api/v1/chat/messages` — plain-English questions, answered from real call data through ~20 purpose-built SQL functions, not a general-purpose model guessing at the numbers.
+- **The waveform tells the story before you press play.** Every mood shift is colour-coded directly on the waveform, and marked with clickable timestamp chips — e.g. "0:13 Agent Rude", "0:16 Customer Irritated" — that jump straight to that exact moment. A manager doesn't have to scrub through a five-minute call to find where it went wrong; the trouble spots are visible and one click away.
+- **Every call is a complete dossier on one screen.** Recording, transcript, the 7-rule etiquette checklist, the manager-attention score with its full scoring breakdown, and the mood timeline — all together, not scattered across tabs.
+- **Team performance at a glance.** The Team page renders each agent's activity as a GitHub-contributions-style heatmap, coloured by how that day's calls went, alongside a per-rule etiquette pass-rate breakdown — a manager can spot a rough week, or exactly which etiquette rule an agent keeps missing, without opening a single report.
+- **Company-wide efficiency, not just per-call.** Average call duration is surfaced on the dashboard against a target, so "how long does it actually take us to resolve an issue" is one glanceable number instead of something a manager has to go compute.
+- **Messy real-world identity data, handled gracefully.** Agents in the source data reuse the same speaker ID under different display names. Rather than silently merging them or arbitrarily picking one, every name ever seen for that identity is tracked and shown, so agent-level stats stay correctly attributed instead of quietly fragmenting.
+- **Upload validation is strict on purpose.** Only `.mp3`/`.wav` is accepted, and every file is screened for silence, music-only content, and corrupt audio *before* it's allowed anywhere near the (paid) transcription step — bad input is caught at the door, not three pipeline stages downstream.
+- **Uploads survive a page refresh.** The upload endpoint returns as soon as the ZIP is fully received; every later stage runs server-side in the queue regardless of whether the browser tab stays open, and progress is re-readable at any time from `GET /api/v1/upload-batches/:batchId`.
 
 ## The etiquette contract
 
