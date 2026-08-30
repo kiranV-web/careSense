@@ -1,247 +1,220 @@
-# CareSense server — finalized backend
+# CareSense — Backend
 
-The server ingests ZIP batches, asynchronously transcribes accepted recordings with speaker diarization and timestamps,
-then micro-batches completed transcripts for structured OpenAI analysis.
+CareSense turns raw call-centre recordings into a call-centre analyst that never sleeps: it transcribes every call, works out what the customer wanted and whether they got it, tracks the moment a call turned bad, and tells a manager exactly which 5 calls out of 300 deserve their attention today — with the timestamp and words that justify every claim.
 
-For each valid `audio + metadata` pair the API:
+This repository is the backend: the ingestion pipeline, the transcription and analysis workers, the scoring engine, and the REST API. The dashboard that sits on top of it lives in the sibling [`careSense-dashboard`](https://github.com/kiranV-web/caresense-dashbord) repository.
 
-1. validates the metadata contract;
-2. upserts the customer and agent by their external IDs;
-3. streams only the MP3/WAV object to Cloudflare R2;
-4. stores its object URL and raw metadata in PostgreSQL;
-5. creates the recording with `validation_status = NOT_DONE`;
-6. writes a transactional transcription outbox entry so the recording is queued reliably.
+## Tech stack
 
-Unsupported, missing, duplicate, and malformed entries are persisted in `batch_file_staging` and are never uploaded to R2. One bad pair does not prevent other valid pairs from being ingested.
+| Layer | Technology |
+|---|---|
+| API server | Node.js, Express 5, TypeScript |
+| Background workers | BullMQ (transcription / analysis / recurrence queues), same codebase as the API, run as a separate process |
+| Queue broker | Redis 7 |
+| Database | PostgreSQL 16 |
+| Object storage | Cloudflare R2 (S3-compatible) — audio files only |
+| AI — speech-to-text | OpenAI `audio.transcriptions.create`, model `gpt-4o-transcribe-diarize` |
+| AI — call analysis, recurrence detection, chat agent, coaching insights | OpenAI Responses API, model `gpt-5.6-luna`, strict JSON-schema structured output |
+| Containers | Docker, multi-stage builds |
+| Deployment | Single DigitalOcean Droplet, `docker compose`, Nginx (in the dashboard container) reverse-proxying `/api` to this service |
 
-## ZIP contract
+## How a call becomes a manager's insight
 
-```text
-batch.zip
-├── Conv1.mp3
-├── Conv1_meta.json
-├── Conv2.wav
-└── Conv2_meta.json
+```mermaid
+flowchart TD
+    ZIP["callradar-data.zip<br/>audio/&lt;id&gt;.mp3 + metadata/&lt;id&gt;.json"]
+    ZIP -->|"POST /api/v1/upload-batches<br/>(or npm run upload:batch)"| INGEST
+
+    subgraph STAGE1["① Ingestion &amp; validation"]
+        INGEST["Validate &amp; pair ZIP entries<br/>(schema check, .mp3/.wav only)"]
+        AUDIOCHECK{"Audio valid?<br/>not silent · not music ·<br/>not too short"}
+        DEDUPE{"Duplicate audio?<br/>SHA-256 checksum"}
+        R2["Store audio in<br/>Cloudflare R2"]
+        DBROW["Upsert customers/agents<br/>Create call_recordings row"]
+        REJECT["Reject → failed_calls<br/>(rest of the batch keeps going)"]
+        INGEST --> AUDIOCHECK
+        AUDIOCHECK -->|yes| DEDUPE
+        AUDIOCHECK -->|no| REJECT
+        DEDUPE -->|no| R2 --> DBROW
+        DEDUPE -->|yes| REJECT
+    end
+
+    DBROW --> OUTBOX1[("transcription_outbox")]
+    OUTBOX1 -->|"outbox poller (500ms)"| Q1["BullMQ queue: transcription<br/>(Redis)"]
+
+    subgraph STAGE2["② Transcription — turning audio into text"]
+        Q1 --> SPLIT["ffmpeg splits the stereo channels<br/>left = AGENT · right = CUSTOMER"]
+        SPLIT --> STT["OpenAI speech-to-text<br/>gpt-4o-transcribe-diarize"]
+        STT --> MERGE["Merge both channels into one<br/>ordered, timestamped transcript"]
+        MERGE --> TDB[("transcripts +<br/>transcript_segments<br/>(speaker, start/end seconds, text)")]
+    end
+
+    TDB --> OUTBOX2[("analysis_outbox")]
+    OUTBOX2 -->|"outbox poller (500ms)"| Q2["BullMQ queue: analysis<br/>(micro-batches of ≤4 calls)"]
+
+    subgraph STAGE3["③ Analysis — building the intelligence"]
+        Q2 --> LLM["OpenAI Responses API<br/>gpt-5.6-luna · strict JSON schema"]
+        LLM --> EXTRACT["Per call: intent, resolution status,<br/>24-word summary, per-segment mood,<br/>7-rule etiquette check, urgency"]
+        EXTRACT --> ADB[("call_recordings +<br/>call_evaluations +<br/>segment textual_tone")]
+        ADB -->|"flagged for review"| ALERT[("manager_alerts")]
+    end
+
+    ADB -->|"whole batch analyzed"| Q3["BullMQ queue: recurrence<br/>(per customer)"]
+
+    subgraph STAGE4["④ Recurring-issue linking"]
+        Q3 --> GROUP["Cluster this customer's calls from<br/>the last 10 days by issue<br/>category/cause"]
+        GROUP --> RLLM["OpenAI: verdict +<br/>recommended action"]
+        RLLM --> RDB[("recurring_call_groups")]
+    end
+
+    subgraph SERVE["⑤ Serving layer — nothing above re-runs per request"]
+        SCORE["managerAttention.ts — scored on read:<br/>rude +50 · unresolved +30 ·<br/>etiquette 30+5k · recurring +15 → capped at 99"]
+        API["Express REST API"]
+        UI["React dashboard"]
+        API --> SCORE
+        API --> UI
+    end
+
+    ADB --> API
+    TDB --> API
+    RDB --> API
+    ALERT --> API
+    R2 -.->|"byte-range audio stream"| API
 ```
 
-The session format pairs metadata to audio using its exact `audio_file` value. The original format from `Project-intel.txt` remains supported through exact filename stems.
+Nothing is re-computed on request: transcription, analysis, and recurrence all run exactly once per call and are cached in Postgres. The only thing computed live, on every request, is the manager-attention score — cheap arithmetic over already-analyzed data, so it's always exactly consistent with the latest data and never needs a background recompute job.
 
-CallRadar archives may instead use sibling `metadata/<sid>.json` and `audio/<sid>.mp3` entries. Their stereo contract is fixed: the left channel is the agent and the right channel is the customer. Source speaker IDs are retained on every recording for traceability.
+## What this covers, against the brief
 
-For session metadata, the service reads customer and agent IDs from their nested `metadata` objects, converts `start_time_ms` to UTC, defaults missing language from `DEFAULT_CALL_LANGUAGE`, and retains the complete original JSON.
+**Required**
+- ✅ Audio → speaker-attributed, timestamped transcript (stage ② above) — no pre-supplied transcripts are used.
+- ✅ Per customer: every customer, by their caller ID, with full call history — recording + transcript for every call (`GET /api/v1/customers`, `/api/v1/customers/:id`).
+- ✅ Per call: intent (`customer_problem`), mood and where it shifted (per-segment `textual_tone`, timestamped), resolution status, a summary (24 words, under the 40-word cap) — all on `GET /api/v1/calls/:id`.
+- ✅ Ranked "needs a manager's attention today" (`GET /api/v1/calls-grouped?status_filter=attention`, `GET /api/v1/manager-attention/summary`) — see [Scoring](#the-manager-attention-score) below.
+- ✅ Trending issues (`GET /api/v1/recurring-groups/:id`, recurrence stage ④).
+- ✅ Per-agent view — call volumes, handle times, outcomes (`GET /api/v1/dashboard/team`, `GET /api/v1/agents/:id/calls`).
+- ✅ Every judgment cites the moment that justifies it: segment-level `textual_tone` is timestamped, etiquette rule verdicts come with quoted transcript evidence, `customer_problem.evidence` is a transcript excerpt.
 
-## Local setup
+**Beyond the brief**
+- Call-volume and issue trends across the whole dataset, not just per customer.
+- An AI coaching insight that reads team-wide etiquette performance and tells a manager what to work on next (`GET /api/v1/dashboard/coaching-insight`).
+- A per-agent etiquette heatmap.
+- A 7-rule etiquette contract every agent is checked against on every call (see below).
+- A chat agent (`POST /api/v1/chat/messages`) — a manager can ask a question in plain English and get an answer sourced from ~20 purpose-built SQL functions over the real data, not a general-purpose free-text model.
+- Uploads survive a page refresh: the upload endpoint returns as soon as the ZIP is fully received; every later stage runs server-side in the queue regardless of whether the browser tab stays open, and progress is re-readable at any time from `GET /api/v1/upload-batches/:batchId`.
+
+## The etiquette contract
+
+Every call is checked against the same seven rules, each with a pass/fail verdict and quoted evidence:
+
+`Greeting` · `Introduction` · `Empathy` (only when the situation calls for it — e.g. always applicable for a lost/stolen card, not applicable for a routine balance check) · `Offered help` · `Clear guidance` · `Thanked customer` · `Closing`
+
+Results are stored in `call_evaluations`, one row per call.
+
+## The manager-attention score
+
+Score is computed live (`src/services/managerAttention.ts`), never stored, as the sum of every factor that applies to a call:
+
+| Factor | Points |
+|---|---|
+| Rude call | +50 |
+| Unresolved (or escalated) | +30 |
+| Etiquette rule(s) missed | +30, then +5 per additional rule failed |
+| Recurring issue | +15 |
+
+The total is capped at **99** — a call scoring 90+ is `Critical` and lands at the top of the queue for direct manager review. Bands below that: `High` (75+), `Medium` (60+), `Elevated review` (45+), `Quality review` (below that). Every score comes with its full factor breakdown so a manager can see exactly why a call landed where it did — this is surfaced in the dashboard as a hover tooltip on the call-detail page.
+
+## Data model (PostgreSQL)
+
+| Table | Stores |
+|---|---|
+| `upload_batches` | One row per ZIP upload; processing state and counters |
+| `customers`, `agents` | Identity, keyed by the caller/agent ID present in the source data |
+| `call_recordings` | The central call row — storage location, transcription/analysis status, resolution, issue classification, `customer_problem`, urgency |
+| `failed_calls` | Rejected ZIP entries with a reason (`SIZE_EXCEEDED`, `UNSUPPORTED_FORMAT`, `DUPLICATE_CALL`, `SILENT_AUDIO`, `MUSIC_DETECTED`, `AUDIO_TOO_SHORT`, `INVALID_AUDIO`, …) |
+| `transcripts`, `transcript_segments` | Full transcript text, and one row per speaker turn with `start_seconds`/`end_seconds` and `textual_tone` |
+| `call_evaluations` | The seven etiquette rule verdicts |
+| `manager_alerts` | The attention-queue entry for a flagged call |
+| `recurring_call_groups`, `recurring_call_members` | AI-grouped clusters of a customer's repeat calls about the same issue |
+| `transcription_outbox`, `analysis_outbox` | Transactional outbox rows guaranteeing every call reaches the next stage exactly once, even across a restart |
+| `application_settings` | Runtime-tunable settings — recurrence lookback window (10 days by default), ideal call duration, enabled etiquette rules |
+
+## Validation on the way in
+
+- Only `.mp3` and `.wav` audio is accepted; anything else is rejected per-file without failing the rest of the batch.
+- Every audio file is screened before it's queued for transcription: **silent recordings**, **music-only files**, and **corrupt/invalid audio** are all detected and rejected (`failed_calls.failure_reason`), so garbage never reaches the (paid) transcription step.
+- Duplicate audio is detected by content (SHA-256 checksum), not filename — re-uploading the same recording under a new name is still caught.
+- There's no hard cap on ZIP size, but batches of roughly 50 calls at a time keep processing time and OpenAI rate limits comfortable.
+
+## Known data notes
+
+- The 1,441-call dataset provided didn't naturally contain many recurring-issue or rude-call examples to demonstrate those features against. A supplementary test batch built specifically to exercise recurring-issue grouping and rude-call flagging is available at:
+  `https://pub-0ca6da575fa54913ac646f0806a77d62.r2.dev/test-batches/recurring-callz-f0293c18c4ea.zip`
+  — upload it the same way as the main dataset to see both features in action.
+- In the source data, an agent's speaker ID is sometimes reused across different display names. Rather than assume one name per ID, the system keeps every name ever seen for an agent identity (`agents.speaker_ids_seen`) so agent-level stats stay correctly attributed.
+
+## Running it from scratch
+
+### Local development
 
 ```bash
-cp .env.example .env
-docker compose up -d
+cp .env.example .env        # fill in OPENAI_API_KEY, Cloudflare R2 credentials
+docker compose up -d        # Postgres (port 5433) + Redis (port 6380)
 npm install
 npm run migrate
-npm run dev
+
+npm run dev                 # terminal 1 — API on :1000 (PORT in .env.example)
+npm run worker              # terminal 2 — BullMQ workers
 ```
 
-Start the worker in a second terminal:
+Ingest the dataset:
 
 ```bash
-npm run worker
+npm run upload:batch -- ./callradar-data.zip http://localhost:1000
+curl http://localhost:1000/api/v1/upload-batches/<batchId>          # poll status
+curl http://localhost:1000/api/v1/upload-batches/<batchId>/events   # or subscribe to SSE progress
 ```
 
-Reset all CareSense test data, Redis queues, local staging files, and R2 recordings:
+Then start the dashboard (see [`careSense-dashboard`](https://github.com/kiranV-web/caresense-dashbord)) — its dev server proxies to `http://localhost:1000` by default.
+
+### Full stack in Docker (one Droplet, one command)
+
+From the parent directory containing both `careSense-server` and `careSense-dashboard` as sibling checkouts, with the root-level `docker-compose.yml`:
 
 ```bash
-npm run flush:all -- --yes
+cp .env.example .env        # root-level env: Postgres/Redis passwords, OPENAI_API_KEY, R2 credentials, VITE_* build args
+docker compose up -d --build
 ```
 
-To truncate only operational PostgreSQL data while retaining settings, migration history, queues, staging, and R2 objects:
+This builds and starts, in order: `postgres` → `redis` → `migrate` (runs the SQL migrations, then exits) → `api` + `worker` → `dashboard` (Nginx, serves the built React app and reverse-proxies `/api/*` to the `api` container). Only port 80 is published to the host; Postgres, Redis, and the API are reachable only from other containers on the compose network.
+
+## API reference
+
+| Endpoint | Purpose |
+|---|---|
+| `POST /api/v1/upload-batches` | Upload one ZIP (`multipart/form-data`, field `archive`) — returns `202` immediately |
+| `GET /api/v1/upload-batches/:id` | Batch state and per-stage counters |
+| `GET /api/v1/upload-batches/:id/events` | Server-Sent Events stream of live progress |
+| `GET /api/v1/upload-batches/:id/staging-errors` / `/failed-calls` | Rejected files and why |
+| `GET /api/v1/calls` | Paginated, filterable call list |
+| `GET /api/v1/calls-grouped?status_filter=attention` | The ranked "needs manager attention" queue |
+| `GET /api/v1/calls/:id` | Full call detail — transcript, segments, tones, rules, resolution, attention score |
+| `GET /api/v1/calls/:id/audio` | Audio playback, proxied from R2 with HTTP byte-range support |
+| `GET /api/v1/manager-attention/summary` | Attention-queue totals by reason, for the dashboard's summary tile |
+| `GET /api/v1/customers` / `GET /api/v1/customers/:id` | Customer list / one customer's full call history |
+| `GET /api/v1/recurring-groups/:id` | A recurring-issue cluster's summary, verdict, and call timeline |
+| `GET /api/v1/dashboard/home` / `/team` / `/agent-quality` / `/coaching-insight` | KPI, team, per-agent-quality, and AI coaching views |
+| `GET /api/v1/agents/:id/calls` | One agent's calls and etiquette results |
+| `GET /api/v1/manager-alerts` / `PATCH /api/v1/manager-alerts/:id` | Attention-queue entries, and marking one reviewed |
+| `POST /api/v1/chat/messages` | The chat agent |
+| `GET /health` / `GET /ready` | Liveness / readiness (Postgres, Redis, R2) |
+
+## Resetting local data
 
 ```bash
-npm run truncate:data -- --yes
+npm run flush:all -- --yes       # wipe Postgres data, Redis queues, and R2 recordings
+npm run truncate:data -- --yes   # wipe only operational Postgres rows, keep settings/migrations
+npm run flush:queues -- --yes    # wipe only Redis/BullMQ state
 ```
 
-To clear only Redis and every BullMQ queue state:
-
-```bash
-npm run flush:queues -- --yes
-```
-
-The reset command is disabled in production and preserves `application_settings` and `schema_migrations`. Stop active
-API and worker processes before running it so no in-flight upload or AI request can write data during the reset.
-
-The worker uses local Redis on port 6380, processes up to four OpenAI transcription requests concurrently,
-and analyzes up to four ready calls per request with `gpt-5.6-luna`. Partial analysis groups are released after
-`ANALYSIS_GROUP_MAX_WAIT_MS`, so a small batch does not wait indefinitely.
-
-After every analyzable call reaches a terminal analysis state, customer-scoped recurrence jobs load that customer's
-analyzed call summaries from the configurable lookback window. When at least two calls exist, Luna uses strict
-Structured Outputs to group only calls discussing the same underlying issue; unrelated calls from the same customer
-remain separate. The combined summary, verdict, recommended action, model version, and ordered call references are
-stored in PostgreSQL. Advisory locks prevent concurrent batches for one customer from racing.
-
-The project PostgreSQL container is exposed on port 5433 to avoid conflicting with an existing local database. Cloudflare R2 credentials are read from `.env`.
-
-## Upload
-
-```bash
-curl -X POST http://localhost:3000/api/v1/upload-batches \
-  -F 'archive=@./batch.zip'
-```
-
-To display an explicit upload percentage, use the included client:
-
-```bash
-npm run upload:batch -- ./batch.zip
-```
-
-Retrieve the result and rejected-file names:
-
-```bash
-curl http://localhost:3000/api/v1/upload-batches/BATCH_UUID
-curl http://localhost:3000/api/v1/upload-batches/BATCH_UUID/staging-errors
-```
-
-The upload returns HTTP `202` after the ZIP transfer and queue handoff. Ingestion and transcription continue asynchronously. Poll `status_url` or subscribe to `events_url` for live progress.
-
-Because processing is asynchronous, the upload request still returns HTTP `202`. A batch that later fails moves to `processing_state = FAILED`; its status resource includes `failure_reason` and `failure_details`. Expected reasons include `ALL_CALLS_FAILED` and `ARCHIVE_PROCESSING_FAILED`; partial batches expose their individual failures separately.
-
-The status resource exposes separate counters for `ingestion`, `transcription`, `analysis`, and `textual_tone`, plus
-`processing_percentage`. The SSE endpoint emits the same snapshot whenever it changes.
-
-Cancellation is terminal and idempotent for an already-cancelled batch. Pending ingestion, transcription, analysis,
-and recurrence jobs are removed. A provider request already in flight may finish remotely, but workers check the
-cancelled state before saving results, so no later stage is started for that batch.
-
-## Upload percentage
-
-Upload percentage is measured on the client, independently from server processing. A browser/Node client using Axios can report it as follows:
-
-```ts
-const form = new FormData();
-form.append('archive', zipFile);
-
-await axios.post('/api/v1/upload-batches', form, {
-  onUploadProgress(event) {
-    if (event.total) console.log(Math.round((event.loaded / event.total) * 100));
-  }
-});
-```
-
-This is the accurate byte-transfer percentage. The batch endpoints report processing and validation results after the upload reaches 100%.
-
-## Size and duplicate validation
-
-- `MAX_UPLOAD_BYTES` is a separate archive safety limit and defaults to 1 GiB; it is not the per-call 12 MiB limit.
-- `MAX_INGEST_FILE_BYTES=12582912` applies independently to every uncompressed MP3, WAV, and metadata JSON entry.
-- Oversized audio or metadata is never uploaded to R2 or made eligible for transcription. It is stored in `failed_calls` with `failure_reason = SIZE_EXCEEDED`.
-- Only MP3/WAV audio and `_meta.json` metadata are eligible. Unsupported formats are stored with `UNSUPPORTED_FORMAT`; malformed or schema-invalid JSON is stored with `INVALID_METADATA`.
-- Rejected items are isolated: other valid calls in the same ZIP continue processing.
-- Audio without metadata is stored in `failed_calls` as `MISSING_METADATA`; metadata with no referenced audio is stored as `MISSING_AUDIO`. Neither case creates a processable call.
-- Duplicate recording content is detected with a SHA-256 checksum, not the filename. Renaming an identical audio file does not bypass duplicate detection.
-- For duplicates within one ZIP, the first occurrence is accepted and each later occurrence is skipped.
-- Skipped duplicates are inserted into `failed_calls` with `failure_reason = DUPLICATE_CALL`, their own call ID, checksum, and `duplicate_of_external_call_id`. They are not uploaded to R2.
-
-## API
-
-- `POST /api/v1/upload-batches` — stream one ZIP in multipart field `archive`
-- `GET /api/v1/upload-batches/:batchId` — batch counters and state
-- `GET /api/v1/upload-batches/:batchId/staging-errors` — unwanted/missing/invalid filenames
-- `GET /api/v1/upload-batches/:batchId/failed-calls` — files excluded from downstream processing, including size failures
-- `GET /api/v1/upload-batches/:batchId/events` — SSE batch progress
-- `POST /api/v1/upload-batches/:batchId/cancel` — stop an active batch and remove its pending queue jobs
-- `GET /api/v1/calls/:callId/transcription` — transcript and ordered timestamped speaker segments
-- `GET /api/v1/calls/:callId/analysis` — title, issue classification, rule booleans, urgency, and analysis state
-- `GET /api/v1/calls` — paginated/filterable manager call list
-- `GET /api/v1/calls-grouped` — call-list rows with each confirmed recurring group collapsed into one row
-- `GET /api/v1/calls/:callId` — complete metadata, rules, segments, tones, alert, and recurrence detail
-- `GET /api/v1/recurring-groups/:groupId` — combined recurrence review and ordered call timeline
-- `GET /api/v1/calls/:callId/audio` — R2-backed audio proxy with HTTP byte-range support
-- `GET /api/v1/dashboard/home` — daily KPIs, yesterday comparison, weekly volume, banking-product/enquiry rankings, and today's recurring/rude calls
-- `GET /api/v1/dashboard/team` — agents active on the selected day with call and resolution totals
-- `GET /api/v1/agents/:agentId/calls` — one agent's paginated calls and unchanged seven-rule etiquette results for the selected day
-- `GET /api/v1/settings` — recurrence window, ideal call duration, and enabled etiquette rule keys
-- `PATCH /api/v1/settings` — update one or more application settings
-- `GET /api/v1/manager-alerts` — paginated manager-attention queue
-- `PATCH /api/v1/manager-alerts/:alertId` — update alert status and notes
-- `GET /health` — process liveness
-- `GET /ready` — PostgreSQL, Redis, and Cloudflare R2 readiness
-
-## Security limits
-
-The service streams the multipart ZIP to a private temporary file, checks ZIP paths, limits compressed bytes, metadata bytes, and entry count, and streams accepted audio from ZIP to Cloudflare R2. Adjust limits in `.env`; no uploaded file is loaded wholesale into memory.
-
-R2 objects should remain private. Without `R2_PUBLIC_BASE_URL`, `recording_url` stores the stable R2 HTTPS object location, but accessing a private object still requires a signed request. A protected download API can be introduced later.
-
-## Phase 3 analysis
-
-After a transcript is committed, the same database transaction adds it to `analysis_outbox`. The worker groups up to four
-ready calls and requests strict JSON Schema output from OpenAI. Results are matched by immutable call and segment UUIDs;
-missing, duplicate, or unexpected IDs reject the entire response instead of writing mismatched annotations.
-
-Rules are stored in `call_evaluations`. Overall classifications are stored on `call_recordings`, and each tone is stored in
-`transcript_segments.textual_tone`. Calls requiring attention create an idempotent `manager_alerts` row. A grouped request
-that exhausts its retries is split into one-call groups, isolating a persistently bad call from the rest of the batch.
-
-## Full Docker deployment
-
-PostgreSQL and Redis alone:
-
-```bash
-docker compose up -d postgres redis
-```
-
-Build and run migrations, API, worker, PostgreSQL, and Redis:
-
-```bash
-docker compose --profile app up -d --build
-```
-
-The `migrate` service exits after applying pending SQL files. `api` and `worker` start only after migration succeeds.
-The local `.env` is injected at runtime and excluded from the container image.
-
-## Call-list filters
-
-`GET /api/v1/calls` supports `batch_id`, `customer_id`, `agent_id`, `issue_category`, `resolution_status`,
-`call_status`, `needs_manager_attention`, `urgency_level`, `processing_state`, `started_from`, `started_to`, `page`,
-and `page_size`. Page size is capped at 100.
-
-`banking_product` filters calls by product. The legacy `device_model` query and response field remain temporarily available only for backward compatibility with previously accepted metadata.
-
-Example:
-
-```bash
-curl 'http://localhost:3000/api/v1/calls?call_status=RUDE&needs_manager_attention=true&page_size=25'
-```
-
-## Dashboard and team APIs
-
-Dashboard dates are interpreted as calendar days in the requested IANA timezone. `date` defaults to the current date
-and `timezone` defaults to `Asia/Kolkata`.
-
-```bash
-curl 'http://localhost:3000/api/v1/dashboard/home?date=2026-08-20&timezone=Asia%2FKolkata'
-curl 'http://localhost:3000/api/v1/dashboard/team?date=2026-08-20&timezone=Asia%2FKolkata'
-curl 'http://localhost:3000/api/v1/agents/ALLREC-AGENT-ARJUN/calls?date=2026-08-20&timezone=Asia%2FKolkata&page=1&page_size=25'
-```
-
-Home rates use all calls on the selected day as their denominator. Resolved, recurring, and rude are independent
-classifications and may overlap. `flagged_calls` contains today's calls tagged `RECURRING` or `RUDE`.
-
-Team results include call count, resolved/unresolved/dropped/escalated counts, calls requiring attention, average
-duration, and resolution rate for each active agent. Agent-call results retain the seven backend etiquette booleans;
-all of them evaluate agent behavior only.
-
-## Application settings
-
-Runtime business settings are stored in the singleton `application_settings` PostgreSQL row instead of `.env`.
-The defaults are a 10-day recurring-call lookback and a 300-second ideal call duration. The etiquette array contains
-the enabled keys from the fixed seven-rule backend contract.
-
-```bash
-curl http://localhost:3000/api/v1/settings
-
-curl -X PATCH http://localhost:3000/api/v1/settings \
-  -H 'Content-Type: application/json' \
-  -d '{"recurring_lookback_days":10,"ideal_call_duration_seconds":300}'
-```
-
-Changing `recurring_lookback_days` clears existing recurrence links and queues analyzed calls for recalculation. The
-dashboard home response returns `average_duration.seconds`, `target_seconds`, and `difference_seconds`.
+Disabled in production; stop the API and worker first so nothing writes mid-reset.
