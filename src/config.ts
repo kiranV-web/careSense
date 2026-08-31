@@ -40,7 +40,7 @@ const schema = z.object({
   RECURRENCE_TIMEOUT_MS: z.coerce.number().int().positive().default(180_000),
   REDIS_URL: z.string().url().default("redis://localhost:6380"),
   MAX_UPLOAD_BYTES: z.coerce.number().int().positive().default(1_073_741_824),
-  MAX_ARCHIVE_ENTRIES: z.coerce.number().int().positive().default(500),
+  MAX_ARCHIVE_ENTRIES: z.coerce.number().int().positive().default(50),
   MAX_EXTRACTED_BYTES: z.coerce.number().int().positive().default(5_368_709_120),
   MAX_INGEST_FILE_BYTES: z.coerce.number().int().positive().default(12_582_912),
   AUDIO_PREFLIGHT_ENABLED: booleanString.default(true),

@@ -154,7 +154,7 @@ Every score response includes the numeric score, urgency label, primary reason, 
 - Every audio file is screened before it's queued for transcription: **silent recordings**, **music-only files**, and **corrupt/invalid audio** are all detected and rejected (`failed_calls.failure_reason`), so garbage never reaches the (paid) transcription step.
 - Duplicate audio is detected by content (SHA-256 checksum), not filename — re-uploading the same recording under a new name is still caught.
 - Password-protected ZIP archives are rejected as unsupported.
-- Limits are configurable. Defaults are **1 GiB** per uploaded ZIP, **500** archive entries, **5 GiB** total extracted content, and **12 MiB per audio or metadata entry**. The dashboard applies a separate 200 MiB client-side ZIP guard by default.
+- Limits are configurable. Defaults are **1 GiB** per uploaded ZIP, **50 archive entries**, **5 GiB** total extracted content, and **12 MiB per audio or metadata entry**. ZIP entries include files and directory records, so a standard audio-plus-JSON batch supports roughly 25 complete calls. The dashboard applies a separate 200 MiB client-side ZIP guard by default.
 
 ## Known data notes
 
