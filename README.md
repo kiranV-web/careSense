@@ -94,7 +94,6 @@ Nothing is re-computed on request: transcription, analysis, and recurrence all r
 - ✅ Per call: intent (`customer_problem`), mood and where it shifted (per-segment `textual_tone`, timestamped), resolution status, a summary (24 words, under the 40-word cap) — all on `GET /api/v1/calls/:id`.
 - ✅ Ranked "needs a manager's attention today" (`GET /api/v1/calls-grouped?status_filter=attention`, `GET /api/v1/manager-attention/summary`) — see [Scoring](#the-manager-attention-score) below.
 - ✅ Per-agent view — call volumes, handle times, outcomes (`GET /api/v1/dashboard/team`, `GET /api/v1/agents/:id/calls`).
-- ⚠️ Evidence currently persisted by the API includes the full timestamped, speaker-attributed transcript, timestamped segment tones, and `customer_problem.evidence` as an explicit transcript excerpt. Etiquette and resolution results are displayed beside that transcript, but the current schema does not store a separate timestamp/quote for every individual etiquette or resolution verdict.
 
 **Beyond the brief**
 
