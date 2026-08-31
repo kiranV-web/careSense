@@ -4,6 +4,8 @@ CareSense turns raw call-centre recordings into a call-centre analyst that never
 
 This repository is the backend: the ingestion pipeline, the transcription and analysis workers, the scoring engine, and the REST API. The dashboard that sits on top of it lives in the sibling [`careSense-dashboard`](https://github.com/kiranV-web/caresense-dashbord) repository.
 
+**Live site:** [https://kirancodez.com/](https://kirancodez.com/)
+
 ## Tech stack
 
 | Layer | Technology |
