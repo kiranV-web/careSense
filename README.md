@@ -1,6 +1,6 @@
 # CareSense — Backend
 
-CareSense turns raw call-centre recordings into a call-centre analyst that never sleeps: it transcribes every call, works out what the customer wanted and whether they got it, tracks the moment a call turned bad, and tells a manager exactly which 5 calls out of 300 deserve their attention today — with the timestamp and words that justify every claim.
+CareSense turns raw call-centre recordings into a call-centre analyst that never sleeps: it transcribes every call, works out what the customer wanted and whether they got it, tracks the moment a call turned bad, and ranks the calls that deserve a manager's attention — with the timestamps and words that justify the underlying judgments.
 
 This repository is the backend: the ingestion pipeline, the transcription and analysis workers, the scoring engine, and the REST API. The dashboard that sits on top of it lives in the sibling [`careSense-dashboard`](https://github.com/kiranV-web/caresense-dashbord) repository.
 
@@ -30,7 +30,7 @@ flowchart TD
         AUDIOCHECK{"Audio valid?<br/>not silent · not music ·<br/>not too short"}
         DEDUPE{"Duplicate audio?<br/>SHA-256 checksum"}
         R2["Store audio in<br/>Cloudflare R2"]
-        DBROW["Upsert customers/agents<br/>Create call_recordings row"]
+        DBROW["Upsert caller-ID/agent identities<br/>Preserve the name logged on each call<br/>Create call_recordings row"]
         REJECT["Reject → failed_calls<br/>(rest of the batch keeps going)"]
         INGEST --> AUDIOCHECK
         AUDIOCHECK -->|yes| DEDUPE
@@ -68,7 +68,7 @@ flowchart TD
     end
 
     subgraph SERVE["⑤ Serving layer — nothing above re-runs per request"]
-        SCORE["managerAttention.ts — scored on read:<br/>rude +50 · unresolved +30 ·<br/>etiquette 30+5k · recurring +15 → capped at 99"]
+        SCORE["managerAttention.ts — scored on read:<br/>rude +50 · unresolved +30 ·<br/>etiquette 30+5×failed rules · recurring +15<br/>capped at 99"]
         API["Express REST API"]
         UI["React dashboard"]
         API --> SCORE
@@ -88,11 +88,11 @@ Nothing is re-computed on request: transcription, analysis, and recurrence all r
 
 **Required**
 - ✅ Audio → speaker-attributed, timestamped transcript (stage ② above) — no pre-supplied transcripts are used.
-- ✅ Per customer: every customer, by their caller ID, with full call history — recording + transcript for every call (`GET /api/v1/customers`, `/api/v1/customers/:id`).
+- ✅ Per caller: every caller ID with its logged-name aliases and paginated call history (`GET /api/v1/customers`, `/api/v1/customers/:id`). Each history item links to `GET /api/v1/calls/:id` for its recording and transcript.
 - ✅ Per call: intent (`customer_problem`), mood and where it shifted (per-segment `textual_tone`, timestamped), resolution status, a summary (24 words, under the 40-word cap) — all on `GET /api/v1/calls/:id`.
 - ✅ Ranked "needs a manager's attention today" (`GET /api/v1/calls-grouped?status_filter=attention`, `GET /api/v1/manager-attention/summary`) — see [Scoring](#the-manager-attention-score) below.
 - ✅ Per-agent view — call volumes, handle times, outcomes (`GET /api/v1/dashboard/team`, `GET /api/v1/agents/:id/calls`).
-- ✅ Every judgment cites the moment that justifies it: segment-level `textual_tone` is timestamped, etiquette rule verdicts come with quoted transcript evidence, `customer_problem.evidence` is a transcript excerpt.
+- ⚠️ Evidence currently persisted by the API includes the full timestamped, speaker-attributed transcript, timestamped segment tones, and `customer_problem.evidence` as an explicit transcript excerpt. Etiquette and resolution results are displayed beside that transcript, but the current schema does not store a separate timestamp/quote for every individual etiquette or resolution verdict.
 
 **Beyond the brief**
 
@@ -104,9 +104,9 @@ Nothing is re-computed on request: transcription, analysis, and recurrence all r
 - **Every call is a complete dossier on one screen.** Recording, transcript, the 7-rule etiquette checklist, the manager-attention score with its full scoring breakdown, and the mood timeline — all together, not scattered across tabs.
 - **Team performance at a glance.** The Team page renders each agent's activity as a GitHub-contributions-style heatmap, coloured by how that day's calls went, alongside a per-rule etiquette pass-rate breakdown — a manager can spot a rough week, or exactly which etiquette rule an agent keeps missing, without opening a single report.
 - **Company-wide efficiency, not just per-call.** Average call duration is surfaced on the dashboard against a target, so "how long does it actually take us to resolve an issue" is one glanceable number instead of something a manager has to go compute.
-- **Messy real-world identity data, handled gracefully.** Agents in the source data reuse the same speaker ID under different display names. Rather than silently merging them or arbitrarily picking one, every name ever seen for that identity is tracked and shown, so agent-level stats stay correctly attributed instead of quietly fragmenting.
+- **Messy real-world identity data, handled gracefully.** Callers are grouped by caller `speaker_id`, while every distinct name logged on their calls remains available as an alias in the customer UI. Agents use a normalized name as their stable identity; changing diarization speaker IDs are retained in `speaker_ids_seen` as call-source metadata instead of creating duplicate agent profiles.
 - **Upload validation is strict on purpose.** Only `.mp3`/`.wav` is accepted, and every file is screened for silence, music-only content, and corrupt audio *before* it's allowed anywhere near the (paid) transcription step — bad input is caught at the door, not three pipeline stages downstream.
-- **Uploads survive a page refresh.** The upload endpoint returns as soon as the ZIP is fully received; every later stage runs server-side in the queue regardless of whether the browser tab stays open, and progress is re-readable at any time from `GET /api/v1/upload-batches/:batchId`.
+- **Processing survives a page refresh.** After the ZIP has been fully received and the API has returned a batch ID, every later stage runs server-side regardless of whether the browser stays open. Progress is re-readable from `GET /api/v1/upload-batches/:batchId`. Refreshing while the ZIP bytes themselves are still uploading cancels that browser request and requires a new upload.
 
 ## The etiquette contract
 
@@ -124,17 +124,19 @@ Score is computed live (`src/services/managerAttention.ts`), never stored, as th
 |---|---|
 | Rude call | +50 |
 | Unresolved (or escalated) | +30 |
-| Etiquette rule(s) missed | +30, then +5 per additional rule failed |
+| Etiquette rule(s) missed | +30 base +5 for every failed applicable rule (one failed rule = 35) |
 | Recurring issue | +15 |
 
-The total is capped at **99** — a call scoring 90+ is `Critical` and lands at the top of the queue for direct manager review. Bands below that: `High` (75+), `Medium` (60+), `Elevated review` (45+), `Quality review` (below that). Every score comes with its full factor breakdown so a manager can see exactly why a call landed where it did — this is surfaced in the dashboard as a hover tooltip on the call-detail page.
+The total is capped at **99**. Score bands are `Critical` (90–99), `High` (75–89), `Medium` (60–74), `Elevated review` (45–59), and `Quality review` (0–44). Calls with a closed manager alert and dropped calls are excluded; calls qualify when they are explicitly flagged, rude, recurring, unresolved/escalated, or resolved with a quality-review requirement. The queue sorts by score descending, then puts the oldest call first when scores tie.
+
+Every score response includes the numeric score, urgency label, primary reason, additional reasons, factor list, calculation timestamp, waiting time, rank, queue size, and adjacent call IDs. The dashboard displays the same backend result on the Home tile, attention queue, and call detail; the detailed factor list is an expandable **Why this score?** section, not a frontend approximation.
 
 ## Data model (PostgreSQL)
 
 | Table | Stores |
 |---|---|
 | `upload_batches` | One row per ZIP upload; processing state and counters |
-| `customers`, `agents` | Identity, keyed by the caller/agent ID present in the source data |
+| `customers`, `agents` | Caller and agent profiles. New CallRadar callers are keyed by caller `speaker_id`; agent profiles are keyed by normalized agent name. Per-call raw metadata preserves logged names and source speaker IDs. |
 | `call_recordings` | The central call row — storage location, transcription/analysis status, resolution, issue classification, `customer_problem`, urgency |
 | `failed_calls` | Rejected ZIP entries with a reason (`SIZE_EXCEEDED`, `UNSUPPORTED_FORMAT`, `DUPLICATE_CALL`, `SILENT_AUDIO`, `MUSIC_DETECTED`, `AUDIO_TOO_SHORT`, `INVALID_AUDIO`, …) |
 | `transcripts`, `transcript_segments` | Full transcript text, and one row per speaker turn with `start_seconds`/`end_seconds` and `textual_tone` |
@@ -149,16 +151,25 @@ The total is capped at **99** — a call scoring 90+ is `Critical` and lands at 
 - Only `.mp3` and `.wav` audio is accepted; anything else is rejected per-file without failing the rest of the batch.
 - Every audio file is screened before it's queued for transcription: **silent recordings**, **music-only files**, and **corrupt/invalid audio** are all detected and rejected (`failed_calls.failure_reason`), so garbage never reaches the (paid) transcription step.
 - Duplicate audio is detected by content (SHA-256 checksum), not filename — re-uploading the same recording under a new name is still caught.
-- There's no hard cap on ZIP size, but batches of roughly 50 calls at a time keep processing time and OpenAI rate limits comfortable.
+- Password-protected ZIP archives are rejected as unsupported.
+- Limits are configurable. Defaults are **1 GiB** per uploaded ZIP, **500** archive entries, **5 GiB** total extracted content, and **12 MiB per audio or metadata entry**. The dashboard applies a separate 200 MiB client-side ZIP guard by default.
 
 ## Known data notes
 
 - The 1,441-call dataset provided didn't naturally contain many recurring-issue or rude-call examples to demonstrate those features against. A supplementary test batch built specifically to exercise recurring-issue grouping and rude-call flagging is available at:
   `https://pub-0ca6da575fa54913ac646f0806a77d62.r2.dev/test-batches/recurring-callz-f0293c18c4ea.zip`
   — upload it the same way as the main dataset to see both features in action.
-- In the source data, an agent's speaker ID is sometimes reused across different display names. Rather than assume one name per ID, the system keeps every name ever seen for an agent identity (`agents.speaker_ids_seen`) so agent-level stats stay correctly attributed.
+- Caller display names are not treated as identity. Calls sharing the same caller `speaker_id` appear under one caller, with all distinct logged names shown as aliases.
+- Agent identity is based on normalized agent name (`Mary Jane` → `mary-jane`), not diarization `speaker_id`. `agents.speaker_ids_seen` records every speaker ID observed for that named agent.
 
 ## Running it from scratch
+
+### Prerequisites
+
+- Node.js 22 or newer and npm
+- Docker with Compose (for PostgreSQL and Redis)
+- `ffmpeg` and `ffprobe` available on `PATH` for audio validation and stereo-channel splitting
+- An OpenAI API key and Cloudflare R2 credentials
 
 ### Local development
 
@@ -177,7 +188,7 @@ Ingest the dataset:
 ```bash
 npm run upload:batch -- ./callradar-data.zip http://localhost:1000
 curl http://localhost:1000/api/v1/upload-batches/<batchId>          # poll status
-curl http://localhost:1000/api/v1/upload-batches/<batchId>/events   # or subscribe to SSE progress
+curl -N http://localhost:1000/api/v1/upload-batches/<batchId>/events # or subscribe to SSE progress
 ```
 
 Then start the dashboard (see [`careSense-dashboard`](https://github.com/kiranV-web/caresense-dashbord)) — its dev server proxies to `http://localhost:1000` by default.
@@ -200,9 +211,10 @@ This builds and starts, in order: `postgres` → `redis` → `migrate` (runs the
 | `POST /api/v1/upload-batches` | Upload one ZIP (`multipart/form-data`, field `archive`) — returns `202` immediately |
 | `GET /api/v1/upload-batches/:id` | Batch state and per-stage counters |
 | `GET /api/v1/upload-batches/:id/events` | Server-Sent Events stream of live progress |
+| `POST /api/v1/upload-batches/:id/cancel` | Cancel remaining work for an active batch |
 | `GET /api/v1/upload-batches/:id/staging-errors` / `/failed-calls` | Rejected files and why |
 | `GET /api/v1/calls` | Paginated, filterable call list |
-| `GET /api/v1/calls-grouped?status_filter=attention` | The ranked "needs manager attention" queue |
+| `GET /api/v1/calls-grouped?status_filter=attention` | The individually ranked, score-first manager-attention queue |
 | `GET /api/v1/calls/:id` | Full call detail — transcript, segments, tones, rules, resolution, attention score |
 | `GET /api/v1/calls/:id/audio` | Audio playback, proxied from R2 with HTTP byte-range support |
 | `GET /api/v1/manager-attention/summary` | Attention-queue totals by reason, for the dashboard's summary tile |

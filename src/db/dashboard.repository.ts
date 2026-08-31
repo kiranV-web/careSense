@@ -168,7 +168,7 @@ export class DashboardRepository {
   }
 
   async getTeam(period: TeamPeriod): Promise<Record<string, unknown>> {
-    const [result, activityResult] = await Promise.all([this.pool.query(
+    const [result, activityResult, qualityAgentsResult] = await Promise.all([this.pool.query(
       `SELECT a.id,a.external_id,a.name,a.speaker_ids_seen,
          count(c.id)::integer AS call_count,
          count(c.id) FILTER (WHERE c.resolution_status IN ('RESOLVED','RESOLVED_BUT_IMPROVE_QUALITY'))::integer AS resolved_count,
@@ -195,6 +195,16 @@ export class DashboardRepository {
          FROM call_recordings c
          WHERE (c.started_at AT TIME ZONE $3)::date BETWEEN $1::date AND $2::date
          ORDER BY c.started_at,c.id`, [period.dateFrom, period.dateTo, period.timezone]
+      ),
+      this.pool.query(
+        `SELECT coalesce(nullif(btrim(c.source_agent_speaker_id),''),a.external_id) AS id,
+           coalesce(array_agg(DISTINCT coalesce(nullif(btrim(a.name),''),a.external_id)
+             ORDER BY coalesce(nullif(btrim(a.name),''),a.external_id)),'{}'::text[]) AS logged_names,
+           count(c.id)::integer AS call_count
+         FROM call_recordings c JOIN agents a ON a.id=c.agent_id
+         WHERE (c.started_at AT TIME ZONE $3)::date BETWEEN $1::date AND $2::date
+         GROUP BY coalesce(nullif(btrim(c.source_agent_speaker_id),''),a.external_id)
+         ORDER BY call_count DESC,id`, [period.dateFrom, period.dateTo, period.timezone]
       )
     ]);
     const activity = activityResult.rows.map((row: Record<string, unknown>) => ({
@@ -210,6 +220,10 @@ export class DashboardRepository {
         resolved: result.rows.reduce((sum: number, row: Record<string, unknown>) => sum + number(row.resolved_count), 0)
       },
       activity,
+      quality_agents: qualityAgentsResult.rows.map((row: Record<string, unknown>) => ({
+        id: String(row.id), logged_names: Array.isArray(row.logged_names) ? row.logged_names : [],
+        call_count: number(row.call_count)
+      })),
       agents: result.rows.map((row: Record<string, unknown>) => {
         const calls = number(row.call_count);
         const resolved = number(row.resolved_count);
@@ -281,17 +295,28 @@ export class DashboardRepository {
 
   async getAgentConversationQuality(agentId: string): Promise<Record<string, unknown> | undefined> {
     const agentResult = await this.pool.query(
-      'SELECT id,external_id,name FROM agents WHERE id::text=$1 OR external_id=$1', [agentId]
+      `WITH identities AS (
+         SELECT coalesce(nullif(btrim(c.source_agent_speaker_id),''),a.external_id) AS id,
+           coalesce(array_agg(DISTINCT coalesce(nullif(btrim(a.name),''),a.external_id)
+             ORDER BY coalesce(nullif(btrim(a.name),''),a.external_id)),'{}'::text[]) AS logged_names,
+           count(c.id)::integer AS call_count
+         FROM call_recordings c JOIN agents a ON a.id=c.agent_id
+         GROUP BY coalesce(nullif(btrim(c.source_agent_speaker_id),''),a.external_id)
+       ) SELECT id AS external_id,id,logged_names,call_count FROM identities
+       WHERE id=$1 ORDER BY call_count DESC LIMIT 1`, [agentId]
     );
     if (!agentResult.rows[0]) return undefined;
     const agent = agentResult.rows[0] as Record<string, unknown>;
     const result = await this.pool.query(
       `SELECT r.rule,
-         round(100.0 * avg(CASE WHEN c.agent_id=$1 THEN r.passed::int END)) AS agent_pass_percent,
-         count(*) FILTER (WHERE c.agent_id=$1)::int AS agent_total_calls,
-         count(*) FILTER (WHERE c.agent_id=$1 AND NOT r.passed)::int AS agent_fail_count,
+         round(100.0 * avg(CASE WHEN coalesce(nullif(btrim(c.source_agent_speaker_id),''),a.external_id)=$1
+           THEN r.passed::int END)) AS agent_pass_percent,
+         count(*) FILTER (WHERE coalesce(nullif(btrim(c.source_agent_speaker_id),''),a.external_id)=$1)::int AS agent_total_calls,
+         count(*) FILTER (WHERE coalesce(nullif(btrim(c.source_agent_speaker_id),''),a.external_id)=$1
+           AND NOT r.passed)::int AS agent_fail_count,
          round(100.0 * avg(r.passed::int)) AS team_pass_percent
        FROM call_recordings c
+       JOIN agents a ON a.id=c.agent_id
        JOIN call_evaluations e ON e.call_recording_id=c.id,
        LATERAL (VALUES
          ('greeted_customer',e.greeted_customer), ('introduced_self',e.introduced_self),

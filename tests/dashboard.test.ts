@@ -80,4 +80,25 @@ describe('dashboard repository', () => {
     expect(Object.keys(result.items[0].rules)).toHaveLength(9);
     expect(result.items[0]).toMatchObject({ device_model: 'GENERAL', duration_seconds: 90.5 });
   });
+
+  it('groups conversation quality by source agent ID and preserves logged name aliases', async () => {
+    const query = vi.fn()
+      .mockResolvedValueOnce({ rows: [{
+        id: '44', external_id: '44', logged_names: ['Alex Morgan', 'Alexander Morgan'], call_count: 6
+      }] })
+      .mockResolvedValueOnce({ rows: [{
+        rule: 'greeted_customer', agent_pass_percent: '75', agent_total_calls: 4,
+        agent_fail_count: 1, team_pass_percent: '80'
+      }] });
+    const repository = new DashboardRepository({ query } as unknown as pg.Pool);
+
+    const result = await repository.getAgentConversationQuality('44') as any;
+
+    expect(result.agent).toMatchObject({
+      id: '44', logged_names: ['Alex Morgan', 'Alexander Morgan'], call_count: 6
+    });
+    expect(result.rules[0]).toMatchObject({ rule: 'greeted_customer', agent_pass_percent: 75, total_calls: 4 });
+    expect(String(query.mock.calls[0]![0])).toContain('source_agent_speaker_id');
+    expect(String(query.mock.calls[1]![0])).toContain('source_agent_speaker_id');
+  });
 });

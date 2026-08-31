@@ -343,7 +343,8 @@ export class CallRepository {
     if (filters.callerId) add(`coalesce(nullif(btrim(c.source_caller_speaker_id),''),cu.external_id)=?`, filters.callerId);
     if (filters.agentId) {
       values.push(filters.agentId);
-      clauses.push(`(c.agent_id::text=$${values.length} OR a.external_id=$${values.length})`);
+      clauses.push(`(c.agent_id::text=$${values.length} OR a.external_id=$${values.length}
+        OR c.source_agent_speaker_id=$${values.length})`);
     }
     if (filters.issueCategory) add('c.issue_category=?', filters.issueCategory);
     if (filters.deviceModel) add(`coalesce(nullif(btrim(c.device_model),''),'GENERAL')=?`, filters.deviceModel);
